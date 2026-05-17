@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">IDAdroid</string>
+    <string name="keep_alive_channel_name">IDAdroid 后台保活</string>
+    <string name="keep_alive_channel_description">保持 pi RPC、终端和 VNC 相关任务在后台稳定运行。</string>
+    <string name="keep_alive_notification_title">IDAdroid 正在后台运行</string>
+    <string name="keep_alive_notification_text">保活服务已启用，建议同时关闭电池优化以减少后台被杀。</string>
+</resources>

@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="#000000">
+
+    <LinearLayout
+        android:id="@+id/terminal_toolbar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:background="#191A1F"
+        android:paddingStart="6dp"
+        android:paddingTop="5dp"
+        android:paddingEnd="6dp"
+        android:paddingBottom="5dp">
+
+        <TextView
+            android:id="@+id/terminal_close_button"
+            android:layout_width="54dp"
+            android:layout_height="34dp"
+            android:gravity="center"
+            android:text="关闭"
+            android:textColor="#ECE6F0"
+            android:textSize="12sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/terminal_status_text"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="8dp"
+            android:layout_marginEnd="6dp"
+            android:maxLines="2"
+            android:text="准备启动…"
+            android:textColor="#ECE6F0"
+            android:textSize="13sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/terminal_paste_button"
+            android:layout_width="54dp"
+            android:layout_height="34dp"
+            android:gravity="center"
+            android:text="粘贴"
+            android:textColor="#ECE6F0"
+            android:textSize="12sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/terminal_text_smaller_button"
+            android:layout_width="42dp"
+            android:layout_height="34dp"
+            android:layout_marginStart="4dp"
+            android:gravity="center"
+            android:text="A-"
+            android:textColor="#ECE6F0"
+            android:textSize="12sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/terminal_text_larger_button"
+            android:layout_width="42dp"
+            android:layout_height="34dp"
+            android:layout_marginStart="4dp"
+            android:gravity="center"
+            android:text="A+"
+            android:textColor="#ECE6F0"
+            android:textSize="12sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/terminal_log_button"
+            android:layout_width="46dp"
+            android:layout_height="34dp"
+            android:layout_marginStart="4dp"
+            android:gravity="center"
+            android:text="日志"
+            android:textColor="#ECE6F0"
+            android:textSize="12sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/terminal_reconnect_button"
+            android:layout_width="54dp"
+            android:layout_height="34dp"
+            android:layout_marginStart="4dp"
+            android:gravity="center"
+            android:text="重连"
+            android:textColor="#ECE6F0"
+            android:textSize="12sp"
+            android:textStyle="bold" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:orientation="horizontal"
+        android:background="#000000">
+
+        <com.termux.view.TerminalView
+            android:id="@+id/terminal_view"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:focusable="true"
+            android:focusableInTouchMode="true" />
+
+        <LinearLayout
+            android:id="@+id/extra_keys_container"
+            android:layout_width="248dp"
+            android:layout_height="match_parent"
+            android:orientation="vertical"
+            android:gravity="center_vertical"
+            android:background="#FF2D2D2D"
+            android:paddingHorizontal="4dp"
+            android:paddingVertical="6dp" />
+    </LinearLayout>
+
+</LinearLayout>
