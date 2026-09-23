@@ -46,6 +46,7 @@ import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.automirrored.rounded.NoteAdd
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.rounded.SdCard
 import androidx.compose.material.icons.rounded.Upload
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material3.AlertDialog
@@ -102,7 +103,16 @@ fun HomeFileBrowserPanel(fileManager: ContainerFileManager) {
     val clipboard = LocalClipboardManager.current
     val scope = rememberCoroutineScope()
     val prefs = remember { context.getSharedPreferences("idadroid_file_browser", android.content.Context.MODE_PRIVATE) }
-    var path by remember { mutableStateOf(prefs.getString("path", dev.idadroid.settings.IdaDroidSettings.DEFAULT_WORKSPACE_PATH) ?: "/root/pi_workspace") }
+    // 默认跟随用户设置的“Pi 工作区路径”（可能是 /sdcard、/storage 等外部目录），
+    // 有历史记录时保持历史；都没有时回退到 /root/pi_workspace。
+    val defaultPath = remember {
+        dev.idadroid.settings.IdaDroidSettings(context.applicationContext)
+            .envSettings.value.workspacePath
+            .ifBlank { dev.idadroid.settings.IdaDroidSettings.DEFAULT_WORKSPACE_PATH }
+    }
+    var path by remember {
+        mutableStateOf(prefs.getString("path", defaultPath) ?: defaultPath)
+    }
     var bookmarks by remember {
         mutableStateOf(
             prefs.getStringSet("bookmarks", emptySet())
@@ -195,7 +205,11 @@ fun HomeFileBrowserPanel(fileManager: ContainerFileManager) {
             error = null
             dev.idadroid.util.runCatchingSuspending { fileManager.fileForSharing(entry.path) }
                 .onSuccess { file ->
-                    runCatching { RootfsFileSharing.openFile(context, file) }
+                    // 外部共享存储文件（/sdcard 等）以缓存副本交给外部应用：
+                    // 副本无法写回原文件，因此只授予读权限，避免编辑器"保存"到
+                    // 副本后用户误以为修改已生效。
+                    val writable = !fileManager.isExternalGuestPath(entry.path)
+                    runCatching { RootfsFileSharing.openFile(context, file, writable) }
                         .onFailure { error = "打开失败：${it.message}" }
                 }
                 .onFailure { error = "打开失败：${it.message}" }
@@ -296,6 +310,11 @@ fun HomeFileBrowserPanel(fileManager: ContainerFileManager) {
                     modifier = Modifier.size(19.dp),
                     tint = if (currentBookmarked) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSecondaryContainer
                 )
+            }
+            FilledTonalButton(onClick = { path = "/sdcard" }, contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)) {
+                Icon(Icons.Rounded.SdCard, contentDescription = null, modifier = Modifier.size(17.dp))
+                Spacer(Modifier.width(4.dp))
+                Text("外部", fontSize = 13.sp)
             }
             FilledTonalButton(onClick = { pickUpload.launch(arrayOf("*/*")) }, contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)) {
                 Icon(Icons.Rounded.Upload, contentDescription = null, modifier = Modifier.size(17.dp))
@@ -417,8 +436,14 @@ fun HomeFileBrowserPanel(fileManager: ContainerFileManager) {
                 )
             } else {
                 ListItem(
-                    headlineContent = { Text("打开/编辑") },
-                    supportingContent = { Text("通过 Android 内容提供器交给外部应用") },
+                    headlineContent = { Text(if (fileManager.isExternalGuestPath(entry.path)) "打开（只读）" else "打开/编辑") },
+                    supportingContent = {
+                        Text(
+                            if (fileManager.isExternalGuestPath(entry.path))
+                                "外部共享文件以只读副本打开，修改请用“另存为”"
+                            else "通过 Android 内容提供器交给外部应用"
+                        )
+                    },
                     leadingContent = { Icon(Icons.Rounded.Visibility, contentDescription = null) },
                     modifier = Modifier.clickable { actionEntry = null; openFile(entry) }
                 )

@@ -12,6 +12,7 @@ import dev.idadroid.settings.VncSettings
 import dev.idadroid.util.runCatchingSuspending
 import dev.idadroid.util.safePid
 import java.io.File
+import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.time.Instant
@@ -438,13 +439,21 @@ class VncSessionManager(
         file.parentFile?.mkdirs()
         file.appendText("\n== ${Instant.now()} supervisor started pid=${process.safePid() ?: "unknown"} ==\n")
         Thread {
-            process.inputStream.bufferedReader().useLines { lines ->
-                lines.forEach { file.appendText("[stdout] $it\n") }
+            try {
+                process.inputStream.bufferedReader().useLines { lines ->
+                    lines.forEach { file.appendText("[stdout] $it\n") }
+                }
+            } catch (_: IOException) {
+                // Stream closed by process teardown (stop/destroy); reading is done.
             }
         }.apply { name = "idadroid-vnc-stdout"; isDaemon = true; start() }
         Thread {
-            process.errorStream.bufferedReader().useLines { lines ->
-                lines.forEach { file.appendText("[stderr] $it\n") }
+            try {
+                process.errorStream.bufferedReader().useLines { lines ->
+                    lines.forEach { file.appendText("[stderr] $it\n") }
+                }
+            } catch (_: IOException) {
+                // Stream closed by process teardown (stop/destroy); reading is done.
             }
         }.apply { name = "idadroid-vnc-stderr"; isDaemon = true; start() }
     }

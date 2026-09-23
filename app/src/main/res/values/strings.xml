@@ -27,6 +27,10 @@
     <string name="keep_alive_channel_description">保持 pi RPC、终端和 VNC 相关任务在后台稳定运行。</string>
     <string name="keep_alive_notification_title">IDAdroid 正在后台运行</string>
     <string name="keep_alive_notification_text">保活服务已启用，建议同时关闭电池优化以减少后台被杀。</string>
+    <string name="overlay_channel_name">IDAdroid 悬浮窗</string>
+    <string name="overlay_channel_description">显示可拖动的悬浮快捷球与运行状态。</string>
+    <string name="overlay_notification_title">IDAdroid 悬浮窗已开启</string>
+    <string name="overlay_notification_text">点击悬浮球可展开快捷操作：终端 / Agent 聊天 / 启动或停止 IDA 与 MCP。</string>
 
     <!-- Settings -->
     <string name="settings_title">设置</string>

@@ -189,6 +189,9 @@ fun defaultSystemAppendPrompt(workspacePath: String = "/root/pi_workspace"): Str
 - ida-mcp 文档: /root/ida-pro-9.3/IDA_MCP_MCPC_USAGE.md
 - 附件目录: $workspacePath/.upload
 - MCP 文件传输: /root/.mcp-transfer
+- 路径规则: 容器内没有 /data/user/0/... 宿主路径。如看到宿主形态路径，把
+  /data/user/0/dev.idadroid/files/envs/default/rootfs 前缀替换为 / 即可
+  （即 /root/...、/etc/...）；MCP 传输文件一律用 /root/.mcp-transfer/ 访问
 
 ## 工作准则
 1. **先读文档**: 使用 ida-mcp 前先阅读 IDA_MCP_MCPC_USAGE.md

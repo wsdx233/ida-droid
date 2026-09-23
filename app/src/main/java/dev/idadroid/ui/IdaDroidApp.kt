@@ -8,6 +8,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -52,6 +53,7 @@ import dev.idadroid.env.EnvironmentManager
 import dev.idadroid.env.ImportProgress
 import dev.idadroid.env.ImportStage
 import dev.idadroid.files.ContainerFileManager
+import dev.idadroid.files.RootfsFileSharing
 import dev.idadroid.mcp.IdaMcpSessionManager
 import dev.idadroid.settings.IdaDroidSettings
 import dev.idadroid.terminal.ProotTerminalActivity
@@ -59,13 +61,18 @@ import dev.idadroid.terminal.TerminalLogStore
 import dev.idadroid.vnc.GuiStatus
 import dev.idadroid.vnc.VncSessionManager
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 private enum class IdaDroidScreen { Home, Settings, Agent, About }
 
 @Composable
-fun IdaDroidApp() {
+fun IdaDroidApp(
+    initialAgent: Boolean = false,
+    agentRequest: StateFlow<Int>? = null
+) {
     val context = LocalContext.current
     val settingsStore = remember { IdaDroidSettings(context.applicationContext) }
     val appearance by settingsStore.appearanceSettings.collectAsState()
@@ -90,14 +97,20 @@ fun IdaDroidApp() {
             val vncManager = remember { VncSessionManager(context.applicationContext, settingsStore) }
             val agentManager = remember { PiAgentManager(context.applicationContext) }
             val fileManager = remember { ContainerFileManager(context.applicationContext) }
-            val mcpManager = remember { IdaMcpSessionManager(context.applicationContext, settingsStore = settingsStore) }
+            val mcpManager = remember { IdaMcpSessionManager.get(context.applicationContext, settingsStore) }
             val envState by manager.state.collectAsState()
             val guiState by vncManager.state.collectAsState()
             val agentState by agentManager.state.collectAsState()
             val mcpState by mcpManager.state.collectAsState()
             val vncSettings by settingsStore.vncSettings.collectAsState()
             val scope = rememberCoroutineScope()
-            var currentScreen by remember { mutableStateOf(IdaDroidScreen.Home) }
+            var currentScreen by remember { mutableStateOf(if (initialAgent) IdaDroidScreen.Agent else IdaDroidScreen.Home) }
+            // React to Agent-screen requests arriving while the activity already
+            // exists (floating window "Agent 聊天" routes through onNewIntent).
+            val agentRequestTick by (agentRequest ?: remember { MutableStateFlow(0) }).collectAsState()
+            LaunchedEffect(agentRequestTick) {
+                if (agentRequestTick > 0) currentScreen = IdaDroidScreen.Agent
+            }
             var importProgress by remember { mutableStateOf<ImportProgress?>(null) }
             var validationBusy by remember { mutableStateOf(false) }
             var transientMessage by remember { mutableStateOf<String?>(null) }
@@ -421,6 +434,7 @@ fun IdaDroidApp() {
             if (showMcpLog) {
                 // 异步加载 MCP 日志，避免在主线程上同步读取文件导致 ANR
                 var mcpLog by remember { mutableStateOf<String?>(null) }
+                var exportingLog by remember { mutableStateOf(false) }
                 LaunchedEffect(showMcpLog, mcpState) {
                     if (!showMcpLog) return@LaunchedEffect
                     mcpLog = withContext(Dispatchers.IO) { mcpManager.readLogTail() }
@@ -428,7 +442,34 @@ fun IdaDroidApp() {
                 AlertDialog(
                     onDismissRequest = { showMcpLog = false },
                     confirmButton = {
-                        TextButton(onClick = { showMcpLog = false }) { Text("关闭") }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            if (!exportingLog) {
+                                TextButton(
+                                    onClick = {
+                                        scope.launch {
+                                            exportingLog = true
+                                            kotlin.runCatching {
+                                                val exported = withContext(Dispatchers.IO) {
+                                                    val src = mcpManager.logFile()
+                                                    require(src.isFile && src.length() > 0) { "暂无 MCP 日志文件" }
+                                                    val sharedDir = java.io.File(context.cacheDir, "shared").apply { mkdirs() }
+                                                    val ts = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US)
+                                                        .format(java.util.Date())
+                                                    val dest = java.io.File(sharedDir, "ida-mcp-http-$ts.log")
+                                                    src.copyTo(dest, overwrite = true)
+                                                    dest
+                                                }
+                                                RootfsFileSharing.shareFile(context, exported, "text/plain")
+                                            }
+                                                .onSuccess { transientMessage = "已导出 MCP 日志" }
+                                                .onFailure { e -> transientMessage = "导出 MCP 日志失败：${e.message}" }
+                                            exportingLog = false
+                                        }
+                                    }
+                                ) { Text("导出分享") }
+                            }
+                            TextButton(onClick = { showMcpLog = false }) { Text("关闭") }
+                        }
                     },
                     title = { Text("IDA MCP 日志") },
                     text = {

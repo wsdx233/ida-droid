@@ -8,14 +8,16 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
-import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 
 /**
@@ -133,7 +135,7 @@ class ChatHttpClient(
             if (!systemPrompt.isNullOrBlank()) {
                 add(ChatMessageDto(role = "system", content = systemPrompt))
             }
-            addAll(messages)
+            addAll(normalizeToolPairing(messages))
         }
 
         val requestBody = buildRequestBody(
@@ -419,16 +421,20 @@ class ChatHttpClient(
             json.parseToJsonElement(data).jsonObject
         } catch (e: Exception) { return null }
 
-        // 提取 usage（stream_options.include_usage 返回）
-        val usage = chunk["usage"]?.jsonObject?.let { u ->
+        // 提取 usage（stream_options.include_usage 返回）。
+        // 注意：JSON null 在 kotlinx.serialization 中是 JsonNull 实例而非 Kotlin null，
+        // 不能写 x?["usage"]?.jsonObject —— 值为 null 时不会短路、会抛
+        // "JsonNull is not a JsonObject" 中断整个 SSE 流。这里统一用
+        // as? JsonXxx 安全转换处理。
+        val usage = (chunk["usage"] as? JsonObject)?.let { u ->
             TokenUsage(
-                promptTokens = u["prompt_tokens"]?.jsonPrimitive?.intOrNull ?: 0,
-                completionTokens = u["completion_tokens"]?.jsonPrimitive?.intOrNull ?: 0,
-                totalTokens = u["total_tokens"]?.jsonPrimitive?.intOrNull ?: 0
+                promptTokens = (u["prompt_tokens"] as? JsonPrimitive)?.contentOrNull?.toIntOrNull() ?: 0,
+                completionTokens = (u["completion_tokens"] as? JsonPrimitive)?.contentOrNull?.toIntOrNull() ?: 0,
+                totalTokens = (u["total_tokens"] as? JsonPrimitive)?.contentOrNull?.toIntOrNull() ?: 0
             )
         }
 
-        val choices = chunk["choices"]?.jsonArray
+        val choices = chunk["choices"] as? JsonArray
         // 空 choices（keep-alive usage 帧）— 返回 usage 作为 Finish 事件
         if (choices.isNullOrEmpty()) {
             if (usage != null && pendingToolCalls.isEmpty()) {
@@ -438,36 +444,37 @@ class ChatHttpClient(
             return null
         }
 
-        val choice = choices.firstOrNull()?.jsonObject ?: return null
-        val delta = choice["delta"]?.jsonObject ?: return null
-        val finishReason = choice["finish_reason"]?.jsonPrimitive?.contentOrNull
+        val choice = choices.firstOrNull() as? JsonObject ?: return null
+        val delta = choice["delta"] as? JsonObject ?: return null
+        val finishReason = (choice["finish_reason"] as? JsonPrimitive)?.contentOrNull
 
         // 文本增量
-        delta["content"]?.jsonPrimitive?.contentOrNull?.let { text ->
+        ((delta["content"] as? JsonPrimitive)?.contentOrNull)?.let { text ->
             if (text.isNotEmpty()) return StreamEvent.TextDelta(text)
         }
 
         // 思考/推理增量 — 兼容多种字段名
-        delta["reasoning_content"]?.jsonPrimitive?.contentOrNull?.let { text ->
+        ((delta["reasoning_content"] as? JsonPrimitive)?.contentOrNull)?.let { text ->
             if (text.isNotEmpty()) return StreamEvent.ThinkingDelta(text)
         }
-        delta["thinking"]?.jsonPrimitive?.contentOrNull?.let { text ->
+        ((delta["thinking"] as? JsonPrimitive)?.contentOrNull)?.let { text ->
             if (text.isNotEmpty()) return StreamEvent.ThinkingDelta(text)
         }
         // DeepSeek R1 风格: reasoning_content 在 message 级别
-        chunk["reasoning_content"]?.jsonPrimitive?.contentOrNull?.let { text ->
+        ((chunk["reasoning_content"] as? JsonPrimitive)?.contentOrNull)?.let { text ->
             if (text.isNotEmpty()) return StreamEvent.ThinkingDelta(text)
         }
 
-        // 工具调用增量
-        delta["tool_calls"]?.jsonArray?.forEach { tc ->
-            val tcObj = tc.jsonObject
-            val index = tcObj["index"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 0
+        // 工具调用增量（DeepSeek 的 thinking 帧可能携带空的 tool_calls 数组，
+        // 元素本身也可能为 null，需逐个空安全处理）
+        (delta["tool_calls"] as? JsonArray)?.forEach { tc ->
+            val tcObj = tc as? JsonObject ?: return@forEach
+            val index = (tcObj["index"] as? JsonPrimitive)?.contentOrNull?.toIntOrNull() ?: 0
             val entry = pendingToolCalls.getOrPut(index) { mutableMapOf() }
-            tcObj["id"]?.jsonPrimitive?.contentOrNull?.let { entry["id"] = it }
-            tcObj["function"]?.jsonObject?.let { fn ->
-                fn["name"]?.jsonPrimitive?.contentOrNull?.let { entry["name"] = it }
-                fn["arguments"]?.jsonPrimitive?.contentOrNull?.let { entry["arguments"] = (entry["arguments"] ?: "") + it }
+            ((tcObj["id"] as? JsonPrimitive)?.contentOrNull)?.let { entry["id"] = it }
+            (tcObj["function"] as? JsonObject)?.let { fn ->
+                ((fn["name"] as? JsonPrimitive)?.contentOrNull)?.let { entry["name"] = it }
+                ((fn["arguments"] as? JsonPrimitive)?.contentOrNull)?.let { entry["arguments"] = (entry["arguments"] ?: "") + it }
             }
         }
 
@@ -492,16 +499,16 @@ class ChatHttpClient(
         val parsed = json.parseToJsonElement(body).jsonObject
 
         // OpenAI / Anthropic / Google 统一格式: { "error": { "message": "..." } }
-        parsed["error"]?.jsonObject?.get("message")?.jsonPrimitive?.contentOrNull?.let { return it }
+        ((parsed["error"] as? JsonObject)?.get("message") as? JsonPrimitive)?.contentOrNull?.let { return it }
 
         // OpenAI 变体: { "error": { "code": "...", "detail": "..." } }
-        parsed["error"]?.jsonObject?.get("detail")?.jsonPrimitive?.contentOrNull?.let { return it }
+        ((parsed["error"] as? JsonObject)?.get("detail") as? JsonPrimitive)?.contentOrNull?.let { return it }
 
         // Generic: { "message": "..." }
-        parsed["message"]?.jsonPrimitive?.contentOrNull?.let { return it }
+        (parsed["message"] as? JsonPrimitive)?.contentOrNull?.let { return it }
 
         // Generic: { "detail": "..." }
-        parsed["detail"]?.jsonPrimitive?.contentOrNull?.let { return it }
+        (parsed["detail"] as? JsonPrimitive)?.contentOrNull?.let { return it }
 
         "HTTP $httpCode: $body"
     } catch (_: Exception) {
@@ -510,4 +517,54 @@ class ChatHttpClient(
 
     /** SSE 流读取结果 */
     private data class StreamReadResult(val events: List<StreamEvent>)
+}
+
+/**
+ * 规整消息历史中的 tool_calls ↔ tool 配对，保证发送给 API 的历史合法。
+ *
+ * OpenAI 兼容接口要求：assistant 消息若带 tool_calls，其后必须紧跟覆盖
+ * 每个 tool_call_id 的 tool 消息，否则报
+ * "An assistant message with 'tool_calls' must be followed by tool messages..."。
+ *
+ * 悬挂轮次可能来自：工具执行中途被中止/异常、会话历史截断/摘要压缩、
+ * 或崩溃时持久化的不完整历史。此处按“工具轮”分组清洗：
+ * - assistant(toolCalls) 与其后连续的 tool 消息组成一轮；
+ * - 完整轮（每个 id 恰好被响应一次）原样保留；
+ * - 不完整轮：assistant 若带正文则降级为纯文本消息，其 tool 消息全部丢弃；
+ * - 孤立的 tool 消息（前面没有声明它的 assistant）直接丢弃。
+ */
+internal fun normalizeToolPairing(
+    messages: List<ChatHttpClient.ChatMessageDto>
+): List<ChatHttpClient.ChatMessageDto> {
+    val out = mutableListOf<ChatHttpClient.ChatMessageDto>()
+    var i = 0
+    while (i < messages.size) {
+        val msg = messages[i]
+        if (msg.role == "assistant" && msg.toolCalls.isNotEmpty()) {
+            // 收集紧随其后的连续 tool 消息
+            var j = i + 1
+            val responded = LinkedHashSet<String>()
+            val keptTools = mutableListOf<ChatHttpClient.ChatMessageDto>()
+            while (j < messages.size && messages[j].role == "tool") {
+                val id = messages[j].toolCallId
+                if (id != null && responded.add(id)) keptTools += messages[j]
+                j++
+            }
+            val complete = msg.toolCalls.isNotEmpty() &&
+                msg.toolCalls.all { it.id in responded }
+            if (complete) {
+                out += msg
+                out += keptTools
+            } else if (!msg.content.isNullOrBlank()) {
+                // 不完整工具轮：保留正文，去掉悬空的 tool_calls
+                out += msg.copy(toolCalls = emptyList())
+            }
+            i = j
+        } else {
+            // 孤立 tool（前面没有声明它的 assistant）→ 丢弃
+            if (msg.role != "tool") out += msg
+            i++
+        }
+    }
+    return out
 }

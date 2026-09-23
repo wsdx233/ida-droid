@@ -17,16 +17,28 @@ data class ContainerFileEntry(
     val modifiedAt: String
 )
 
+/**
+ * 浏览/管理容器（proot rootfs）内文件。
+ *
+ * guest 路径解析规则与 PiAgentManager.workspaceHostRoot 保持一致：
+ *  - /root/xxx、/xxx 等普通路径 → rootfs 内部（Android app 私有目录）
+ *  - /sdcard、/storage、/mnt 前缀 → proot 启动时绑定到宿主同名路径，
+ *    所以直接映射到 Android 宿主文件系统（/sdcard → /storage/emulated/0），
+ *    使外部共享存储目录在文件浏览器中“默认可见可访问”。
+ */
 class ContainerFileManager(
     context: Context,
     private val paths: EnvironmentPaths = EnvironmentPaths.of(context)
 ) {
     private val appContext = context.applicationContext
 
+    /** 由 proot 绑定到宿主同名路径的 guest 目录前缀（在 rootfs 之外）。 */
+    private val externalGuestPrefixes = listOf("/sdcard", "/storage", "/mnt")
+
     suspend fun listFiles(path: String): List<ContainerFileEntry> = withContext(Dispatchers.IO) {
         val dir = guestFile(path)
         require(dir.isDirectory) { "目录不存在：${normalizeGuestPath(path)}" }
-        dir.listFiles().orEmpty().map { file -> file.toEntry() }
+        dir.listFiles().orEmpty().map { file -> file.toEntry(normalizeGuestPath(path)) }
     }
 
     suspend fun uploadFile(destinationPath: String, uri: Uri): ContainerFileEntry = withContext(Dispatchers.IO) {
@@ -37,7 +49,7 @@ class ContainerFileManager(
         val target = uniqueFile(dir, name)
         val input = appContext.contentResolver.openInputStream(uri) ?: error("无法打开文件：$uri")
         input.use { source -> target.outputStream().use { source.copyTo(it) } }
-        target.toEntry()
+        target.toEntry(normalizeGuestPath(destinationPath))
     }
 
     suspend fun importInstalledApk(packageName: String, label: String, apkPath: String, destinationPath: String): ContainerFileEntry = withContext(Dispatchers.IO) {
@@ -48,14 +60,14 @@ class ContainerFileManager(
         require(dir.isDirectory) { "目标不是目录：${normalizeGuestPath(destinationPath)}" }
         val target = uniqueFile(dir, "${safeFileName(label.ifBlank { packageName }).removeSuffix(".apk")}.apk")
         source.inputStream().use { input -> target.outputStream().use { output -> input.copyTo(output) } }
-        target.toEntry()
+        target.toEntry(normalizeGuestPath(destinationPath))
     }
 
     suspend fun createDirectory(path: String): ContainerFileEntry = withContext(Dispatchers.IO) {
         requireReady()
         val dir = guestFile(path, mustExist = false).apply { mkdirs() }
         require(dir.isDirectory) { "无法创建目录：${normalizeGuestPath(path)}" }
-        dir.toEntry()
+        dir.toEntry(parentPath(path))
     }
 
     suspend fun createEmptyFile(directoryPath: String, name: String): ContainerFileEntry = withContext(Dispatchers.IO) {
@@ -64,7 +76,7 @@ class ContainerFileManager(
         require(dir.isDirectory) { "目标不是目录：${normalizeGuestPath(directoryPath)}" }
         val target = uniqueFile(dir, name)
         target.writeBytes(ByteArray(0))
-        target.toEntry()
+        target.toEntry(normalizeGuestPath(directoryPath))
     }
 
     suspend fun deleteFile(path: String) = withContext(Dispatchers.IO) {
@@ -77,7 +89,14 @@ class ContainerFileManager(
     suspend fun fileForSharing(path: String): File = withContext(Dispatchers.IO) {
         val file = guestFile(path)
         require(file.isFile) { "文件不存在：${normalizeGuestPath(path)}" }
-        file
+        // rootfs 内的文件通过 FileProvider 直接分享；
+        // 外部共享存储文件（/sdcard 等）不在 provider 覆盖范围，先复制到
+        // 应用缓存目录（cache-path 已声明），保证“打开/编辑”可用。
+        if (!isExternalGuestPath(path)) return@withContext file
+        val cacheRoot = java.io.File(appContext.cacheDir, "shared").apply { mkdirs() }
+        val copy = uniqueFile(cacheRoot, file.name)
+        file.inputStream().use { input -> copy.outputStream().use { output -> input.copyTo(output) } }
+        copy
     }
 
     suspend fun saveFileAs(path: String, destination: Uri) = withContext(Dispatchers.IO) {
@@ -97,6 +116,8 @@ class ContainerFileManager(
     fun parentPath(path: String): String {
         val normalized = normalizeGuestPath(path)
         if (normalized == "/") return "/"
+        // 外部绑定根的父级仍停留在绑定根本身（rootfs 里没有对应的上层目录）
+        if (externalGuestPrefixes.any { normalized == it }) return normalized
         return normalized.trimEnd('/').substringBeforeLast('/', missingDelimiterValue = "/").ifBlank { "/" }
     }
 
@@ -114,10 +135,22 @@ class ContainerFileManager(
         return "/${parts.joinToString("/")}".trimEnd('/').ifBlank { "/" }
     }
 
+    /** guest 路径是否指向外部绑定根（rootfs 之外的真实宿主目录）。 */
+    fun isExternalGuestPath(path: String): Boolean {
+        val normalized = normalizeGuestPath(path)
+        return externalGuestPrefixes.any { prefix -> normalized == prefix || normalized.startsWith("$prefix/") }
+    }
+
     private fun guestFile(path: String, mustExist: Boolean = true): File {
         requireReady()
-        val root = paths.rootfsDir.canonicalFile
         val normalized = normalizeGuestPath(path)
+        // 外部绑定目录：proot 把宿主同名路径挂进容器，Android 侧直接访问宿主路径
+        externalGuestPrefixes.firstOrNull { prefix -> normalized == prefix || normalized.startsWith("$prefix/") }?.let { prefix ->
+            val hostPath = if (prefix == "/sdcard") "/storage/emulated/0" + normalized.removePrefix(prefix) else normalized
+            val host = File(hostPath)
+            return if (mustExist || host.exists()) host.canonicalFile else host.absoluteFile.toPath().normalize().toFile()
+        }
+        val root = paths.rootfsDir.canonicalFile
         val rel = normalized.trimStart('/')
         val raw = if (rel.isBlank()) root else File(root, rel)
         val file = if (mustExist || raw.exists()) raw.canonicalFile else raw.absoluteFile.toPath().normalize().toFile()
@@ -125,13 +158,12 @@ class ContainerFileManager(
         return file
     }
 
-    private fun File.toEntry(): ContainerFileEntry {
-        val root = paths.rootfsDir.canonicalFile
-        val canonical = canonicalFile
-        val rel = canonical.relativeTo(root).path.replace('\\', '/')
-        val guestPath = if (rel.isBlank() || rel == ".") "/" else "/$rel"
+    /** 把宿主文件转成条目；guestPath 是文件所在目录的 guest 路径（避免 canonical 反向映射丢失 /sdcard 前缀）。 */
+    private fun File.toEntry(parentGuestPath: String): ContainerFileEntry {
+        val parent = normalizeGuestPath(parentGuestPath)
+        val guestPath = if (parent == "/") "/$name" else "$parent/$name"
         return ContainerFileEntry(
-            name = if (guestPath == "/") "/" else name,
+            name = name,
             path = guestPath,
             type = if (isDirectory) "directory" else "file",
             size = if (isFile) length() else 0L,

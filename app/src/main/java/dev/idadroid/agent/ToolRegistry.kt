@@ -88,27 +88,91 @@ class ToolContext(
     val paths: EnvironmentPaths,
     val settings: IdaDroidSettings
 ) {
-    /** 工作区在主机文件系统上的相对路径 */
-    val workspaceRel: String get() {
-        val ws = settings.envSettings.value.workspacePath
+    /** 工作区配置路径（proot 内可见，默认 /root/pi_workspace）。 */
+    val workspaceProotPath: String get() =
+        settings.envSettings.value.workspacePath
             .ifBlank { IdaDroidSettings.DEFAULT_WORKSPACE_PATH }
-        return ws.removePrefix("/").ifBlank { "root/pi_workspace" }
+
+    /**
+     * 工作区在宿主文件系统上的根目录（host-aware）。
+     * 与 PiAgentManager.workspaceHostRoot 保持同一映射规则：
+     * - /root/xxx → rootfs 内
+     * - /sdcard、/storage、/mnt → proot 已绑定宿主同名路径，直接使用宿主路径
+     */
+    val workspaceDir: File get() {
+        val ws = workspaceProotPath
+        return when {
+            ws.startsWith("/root/") -> File(paths.rootfsDir, ws.removePrefix("/").ifBlank { "root/pi_workspace" })
+            ws == "/sdcard" || ws.startsWith("/sdcard/") ||
+                ws == "/storage" || ws.startsWith("/storage/") ||
+                ws == "/mnt" || ws.startsWith("/mnt/") -> File(ws)
+            else -> File(paths.rootfsDir, ws.removePrefix("/").ifBlank { "root/pi_workspace" })
+        }
     }
 
-    /** 工作区在主机文件系统上的根目录 */
-    val workspaceDir: File get() = File(paths.rootfsDir, workspaceRel)
+    /** MCP 文件传输目录在主机文件系统上的位置（guest 路径 /root/.mcp-transfer）。 */
+    val transferHostDir: File get() = File(paths.rootfsDir, "root/.mcp-transfer")
+
+    /**
+     * 把 AI 传入的路径归一化为容器内 guest 路径：
+     * - 宿主形态路径（如 /data/user/0/dev.idadroid/files/envs/default/rootfs/root/...）
+     *   → 剥掉 rootfsDir 前缀，得到 /root/...（容器内可见）；
+     * - 其余路径（/root/...、/sdcard/...、相对路径）原样返回。
+     */
+    fun toGuestPath(path: String): String {
+        val raw = path.replace('\\', '/')
+        val root = paths.rootfsDir.absolutePath.replace('\\', '/').trimEnd('/')
+        return if (raw.startsWith("$root/")) raw.removePrefix(root) else raw
+    }
+
+    /** guest 绝对路径 → 宿主文件系统路径（host-aware，与 workspaceDir 同一规则）。 */
+    private fun guestToHostPath(guest: String): String {
+        val external = listOf("/sdcard", "/storage", "/mnt").firstOrNull { p ->
+            guest == p || guest.startsWith("$p/")
+        }
+        return when {
+            external == "/sdcard" -> "/storage/emulated/0" + guest.removePrefix("/sdcard")
+            external != null -> guest  // /storage、/mnt 宿主同名路径
+            guest.startsWith("/") -> File(paths.rootfsDir, guest.removePrefix("/")).absolutePath
+            else -> File(workspaceDir, guest).absolutePath
+        }
+    }
+
+    /**
+     * 将可读区域（工作区 + MCP transfer 目录）内的路径解析为实际文件，
+     * 防止路径遍历攻击；支持宿主形态（/data/user/0/...）路径自动转换，
+     * 且工作区位于外部共享存储（/sdcard、/storage、/mnt）时使用宿主路径解析。
+     * 供 read/list/info 等只读工具使用。
+     */
+    fun resolveReadableFile(path: String): File {
+        val guest = toGuestPath(path)
+        val resolved = if (guest.startsWith("/")) {
+            File(guestToHostPath(guest))
+        } else {
+            File(workspaceDir, guest)
+        }
+        val canonical = resolved.canonicalFile
+        val allowedRoots = listOf(workspaceDir.canonicalFile, transferHostDir.canonicalFile)
+        val inside = allowedRoots.any { base ->
+            canonical.path == base.path || canonical.path.startsWith(base.path + File.separator)
+        }
+        if (!inside) {
+            throw SecurityException("路径越界：$path（可访问：工作区与 /root/.mcp-transfer）")
+        }
+        return canonical
+    }
 
     /**
      * 将工作区内路径解析为实际文件系统路径，防止路径遍历攻击。
      *
      * 安全策略：
-     * - 绝对路径 (/xxx) 在 rootfs 内解析
+     * - 绝对路径 (/xxx) 按 host-aware 规则解析（rootfs 或外部共享存储绑定）
      * - 相对路径在工作区内解析
      * - 规范化后必须在工作区内，否则抛出 SecurityException
      */
     fun resolveWorkspaceFile(path: String): File {
         val resolved = if (path.startsWith("/")) {
-            File(paths.rootfsDir, path.removePrefix("/"))
+            File(guestToHostPath(path))
         } else {
             File(workspaceDir, path)
         }

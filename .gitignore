@@ -8,3 +8,8 @@ local.properties
 *.jks
 .idea/
 .DS_Store
+
+# signing keys
+keystore/
+# build logs
+*.log

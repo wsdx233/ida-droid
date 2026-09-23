@@ -4,7 +4,10 @@ import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.provider.Settings
 import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -59,6 +62,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import dev.idadroid.service.FloatingWindowService
 import dev.idadroid.settings.IdaDroidSettings
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -77,6 +81,15 @@ fun SettingsScreen(
     val agent by settingsStore.agentSettings.collectAsState()
     val appearance by settingsStore.appearanceSettings.collectAsState()
     val env by settingsStore.envSettings.collectAsState()
+    val overlayEnabled by settingsStore.floatingWindowEnabled.collectAsState()
+
+    val overlayPermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        if (Settings.canDrawOverlays(context)) {
+            FloatingWindowService.start(context)
+        } else {
+            Toast.makeText(context, "未授予悬浮窗权限，无法开启悬浮窗", Toast.LENGTH_SHORT).show()
+        }
+    }
 
     // Dialog state
     var editVncPort by remember { mutableStateOf(false) }
@@ -400,6 +413,46 @@ fun SettingsScreen(
                     subtitle = "根据壁纸自动生成配色方案",
                     checked = appearance.dynamicColor,
                     onCheckedChange = settingsStore::updateDynamicColor
+                )
+            }
+
+            // ==================== Floating Window ====================
+            item { HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp)) }
+            item { SettingsSectionHeader("悬浮窗", Icons.Default.Dashboard) }
+            item {
+                SettingsToggleItem(
+                    title = "启用悬浮窗",
+                    subtitle = if (Settings.canDrawOverlays(context)) {
+                        "在其它应用上方显示悬浮快捷球：环境 / IDA / Agent / MCP 状态 + 快捷操作。"
+                    } else {
+                        "需要授予“显示在其他应用上层”权限。"
+                    },
+                    checked = overlayEnabled,
+                    onCheckedChange = { enabled ->
+                        if (enabled) {
+                            if (Settings.canDrawOverlays(context)) {
+                                FloatingWindowService.start(context)
+                            } else {
+                                val intent = Intent(
+                                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                    Uri.parse("package:${context.packageName}")
+                                )
+                                runCatching { overlayPermissionLauncher.launch(intent) }
+                                    .onFailure {
+                                        runCatching {
+                                            overlayPermissionLauncher.launch(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION))
+                                        }.onFailure {
+                                            Toast.makeText(context, "请到系统设置中手动授予悬浮窗权限", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                            }
+                        } else {
+                            // Record user intent before stopping the service;
+                            // the service no longer clears the preference itself.
+                            settingsStore.setFloatingWindowEnabled(false)
+                            FloatingWindowService.stop(context)
+                        }
+                    }
                 )
             }
 
@@ -763,6 +816,10 @@ fun SettingsScreen(
                 settingsStore.resetEnvDefaults()
                 settingsStore.updateThemeMode(IdaDroidSettings.THEME_SYSTEM)
                 settingsStore.updateDynamicColor(true)
+                // 恢复全部默认设置时同时关闭悬浮窗（含停止正在运行的服务），
+                // 否则已启用的覆盖层会保持可见，与“恢复默认”语义不一致。
+                settingsStore.setFloatingWindowEnabled(false)
+                FloatingWindowService.stop(context)
                 confirmResetAll = false
                 Toast.makeText(context, "已恢复全部默认设置", Toast.LENGTH_SHORT).show()
             },

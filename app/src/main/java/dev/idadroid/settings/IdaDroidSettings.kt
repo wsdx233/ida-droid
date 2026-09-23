@@ -40,6 +40,9 @@ class IdaDroidSettings(context: Context) {
     private val _envSettings = MutableStateFlow(readEnvSettings())
     val envSettings: StateFlow<EnvSettings> = _envSettings.asStateFlow()
 
+    private val _floatingWindowEnabled = MutableStateFlow(prefs.getBoolean(KEY_FLOATING_WINDOW, false))
+    val floatingWindowEnabled: StateFlow<Boolean> = _floatingWindowEnabled.asStateFlow()
+
     private val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
         when (key) {
             in VNC_KEYS -> _vncSettings.value = readVncSettings()
@@ -48,12 +51,16 @@ class IdaDroidSettings(context: Context) {
             in AGENT_KEYS -> _agentSettings.value = readAgentSettings()
             in APPEARANCE_KEYS -> _appearanceSettings.value = readAppearanceSettings()
             in ENV_KEYS -> _envSettings.value = readEnvSettings()
+            KEY_FLOATING_WINDOW -> _floatingWindowEnabled.value = prefs.getBoolean(KEY_FLOATING_WINDOW, false)
         }
     }
 
     init {
         // Generate a random VNC password on first install if the default is still in use.
         ensureRandomPasswordIfFirstRun()
+        // ensureRandomPasswordIfFirstRun 刚写入 prefs 的随机密码不会触发刚注册的
+        // listener 重放，直接刷新内存值，避免首次 VNC 启动仍使用 LEGACY 密码。
+        _vncSettings.value = readVncSettings()
         prefs.registerOnSharedPreferenceChangeListener(listener)
     }
 
@@ -213,6 +220,13 @@ class IdaDroidSettings(context: Context) {
         _envSettings.value = readEnvSettings()
     }
 
+    // ==================== Floating Window ====================
+
+    fun setFloatingWindowEnabled(enabled: Boolean) {
+        prefs.edit { putBoolean(KEY_FLOATING_WINDOW, enabled) }
+        _floatingWindowEnabled.value = enabled
+    }
+
     // ==================== Read helpers ====================
 
     private fun readVncSettings(): VncSettings = VncSettings(
@@ -325,6 +339,9 @@ class IdaDroidSettings(context: Context) {
         // Environment keys
         private const val KEY_IDA_HOME = "ida_home"
         private const val KEY_WORKSPACE_PATH = "workspace_path"
+
+        // Floating window
+        private const val KEY_FLOATING_WINDOW = "floating_window_enabled"
 
         // VNC defaults
         const val DEFAULT_VNC_PORT = 5901

@@ -168,7 +168,10 @@ class FileTransferHttpServer(
                         respondJson(output, 404, "{\"error\":\"no transfer matching '" + escapeJson(name) + "'\"}")
                     }
                 } else {
-                    respondJson(output, 200, manager.manifestJson())
+                    // 全量列表不暴露 hostPath：宿主绝对路径在容器内不可访问，会误导 AI。
+                    // 只返回容器内可用的 prootPath 等字段（与单条 entryJson 一致）。
+                    val entries = manager.listTransfers().joinToString(",") { entryJson(it) }
+                    respondJson(output, 200, "{\"entries\":[$entries]}")
                 }
             }
 

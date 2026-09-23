@@ -58,10 +58,10 @@ class ShellTool : AbstractAgentTool() {
  */
 class ReadFileTool : AbstractAgentTool() {
     override val name = "read_file"
-    override val description = "读取工作区内文件内容。支持文本和二进制文件（二进制以 hex 显示）。路径必须在 /root/pi_workspace 内。"
+    override val description = "读取文件内容。支持文本和二进制文件（二进制以 hex 显示）。路径可在工作区 /root/pi_workspace 或 MCP 文件传输目录 /root/.mcp-transfer 内；也接受宿主路径（如 /data/user/0/.../rootfs/root/.mcp-transfer/xxx，将自动映射为容器内路径）。"
     override val parameters: JsonObject = ToolSchema.objectSchema(
         properties = buildJsonObject {
-            put("path", ToolSchema.string("文件路径（相对于工作区或绝对路径）"))
+            put("path", ToolSchema.string("文件路径（工作区或 /root/.mcp-transfer 内，相对或绝对；也支持宿主形态路径）"))
             put("max_bytes", ToolSchema.integer("最大读取字节数", 65536))
         },
         required = listOf("path")
@@ -73,7 +73,7 @@ class ReadFileTool : AbstractAgentTool() {
         val maxBytes = args.getInt("max_bytes") ?: 65536
 
         val file = try {
-            context.resolveWorkspaceFile(path)
+            context.resolveReadableFile(path)
         } catch (e: SecurityException) {
             return ToolOutcome.error(e.message ?: "路径越界")
         }
@@ -141,10 +141,10 @@ class WriteFileTool : AbstractAgentTool() {
  */
 class ListDirTool : AbstractAgentTool() {
     override val name = "list_dir"
-    override val description = "列出工作区内指定目录的文件和子目录。路径必须在 /root/pi_workspace 内。"
+    override val description = "列出目录的文件和子目录。路径可在工作区 /root/pi_workspace 或 MCP 文件传输目录 /root/.mcp-transfer 内（也接受宿主形态路径）。"
     override val parameters: JsonObject = ToolSchema.objectSchema(
         properties = buildJsonObject {
-            put("path", ToolSchema.string("目录路径（相对于工作区或绝对路径）"))
+            put("path", ToolSchema.string("目录路径（工作区或 /root/.mcp-transfer 内）"))
         },
         required = listOf("path")
     )
@@ -154,7 +154,7 @@ class ListDirTool : AbstractAgentTool() {
         val path = args.getString("path") ?: return ToolOutcome.error("缺少 path 参数")
 
         val file = try {
-            context.resolveWorkspaceFile(path)
+            context.resolveReadableFile(path)
         } catch (e: SecurityException) {
             return ToolOutcome.error(e.message ?: "路径越界")
         }
@@ -205,7 +205,8 @@ class SearchFilesTool : AbstractAgentTool() {
 
         // 转义 shell 单引号 — 防止 pattern 中的单引号导致命令注入
         val safePattern = pattern.replace("'", "'\"'\"'")
-        val safePath = path.replace("'", "'\"'\"'")
+        // 容器内看不到宿主 /data/user/0 路径，先映射为 guest 路径（如 /root/.mcp-transfer/xxx）
+        val safePath = context.toGuestPath(path).replace("'", "'\"'\"'")
 
         val command = when (mode) {
             "filename" -> "find '$safePath' -name '*${safePattern}*' 2>/dev/null | head -${maxResults}"
@@ -281,7 +282,7 @@ class DeleteFileTool : AbstractAgentTool() {
  */
 class FileInfoTool : AbstractAgentTool() {
     override val name = "file_info"
-    override val description = "获取工作区内文件或目录的元数据（大小、类型、权限、修改时间等）。路径必须在 /root/pi_workspace 内。"
+    override val description = "获取文件或目录的元数据（大小、类型、权限、修改时间等）。路径可在工作区或 /root/.mcp-transfer 内（也接受宿主形态路径）。"
     override val parameters: JsonObject = ToolSchema.objectSchema(
         properties = buildJsonObject {
             put("path", ToolSchema.string("文件或目录路径"))
@@ -294,14 +295,14 @@ class FileInfoTool : AbstractAgentTool() {
         val path = args.getString("path") ?: return ToolOutcome.error("缺少 path 参数")
 
         val file = try {
-            context.resolveWorkspaceFile(path)
+            context.resolveReadableFile(path)
         } catch (e: SecurityException) {
             return ToolOutcome.error(e.message ?: "路径越界")
         }
         if (!file.exists()) return ToolOutcome.error("文件不存在: $path")
 
         val output = buildString {
-            append("路径: ${file.canonicalPath}\n")
+            append("路径(容器内): ${context.toGuestPath(file.canonicalPath)}\n")
             append("类型: ${if (file.isDirectory) "目录" else "文件"}\n")
             append("大小: ${file.length()} bytes\n")
             append("可读: ${file.canRead()}\n")
@@ -313,7 +314,9 @@ class FileInfoTool : AbstractAgentTool() {
                 append("扩展名: $ext\n")
                 // 用 run_shell 获取 file 命令的输出
                 val fileType = runCatching {
-                    context.proot.executeCommandWithTimeout("file '${file.canonicalPath}'", 5_000)
+                    // 转义单引号，防止 transfer 文件名里的特殊字符注入 shell（CWE-78）
+                    val fileGuestPath = context.toGuestPath(file.canonicalPath).replace("'", "'\"'\"'")
+                    context.proot.executeCommandWithTimeout("file '$fileGuestPath'", 5_000)
                 }.getOrDefault("未知")
                 append("文件类型: $fileType")
             } else if (file.isDirectory) {

@@ -275,6 +275,13 @@ class ConversationEngine(
             emit(ConversationEvent.TurnComplete, onEvent)
 
         } catch (e: CancellationException) {
+            // 中止可能发生在工具执行中途 — 清掉历史中悬挂的不完整工具轮
+            // （assistant 带 tool_calls 但无对应 tool 响应），否则下一轮请求会被 API 拒绝。
+            // 注意：协程已处于取消状态，任何可取消挂起点（ContextWindow 的 mutex）都会
+            // 立即抛 CancellationException，因此清理必须在 NonCancellable 上下文中完成。
+            kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
+                pruneOrphanToolRound(cw)
+            }
             _state.update { ConversationState.Aborted }
             emit(ConversationEvent.TurnComplete, onEvent)
             // 不 re-throw — send() 正常返回，状态已设置为 Aborted
@@ -283,9 +290,19 @@ class ConversationEngine(
                 e.message ?: e::class.simpleName ?: "未知错误",
                 retriable = false
             )
+            pruneOrphanToolRound(cw)
             emit(ConversationEvent.Error(error), onEvent)
             _state.update { ConversationState.Failed(error) }
             emit(ConversationEvent.TurnComplete, onEvent)
+        }
+    }
+
+    /** 清理历史中悬挂的不完整工具轮（发送侧另有 normalizeToolPairing 兜底）。 */
+    private suspend fun pruneOrphanToolRound(cw: ContextWindow) {
+        val snapshot = cw.snapshot()
+        val cleaned = normalizeToolPairing(snapshot)
+        if (cleaned.size != snapshot.size) {
+            cw.replaceAll(cleaned)
         }
     }
 

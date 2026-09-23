@@ -1,4 +1,4 @@
-package dev.idadroid.mcp
+﻿package dev.idadroid.mcp
 
 import android.content.Context
 import android.system.Os
@@ -7,6 +7,8 @@ import dev.idadroid.env.EnvironmentPaths
 import dev.idadroid.proot.IdaProotRuntime
 import dev.idadroid.util.safePid
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.time.Instant
@@ -26,7 +28,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 
-class IdaMcpSessionManager(
+class IdaMcpSessionManager private constructor(
     context: Context,
     private val paths: EnvironmentPaths = EnvironmentPaths.of(context),
     private val settingsStore: dev.idadroid.settings.IdaDroidSettings? = null
@@ -149,10 +151,33 @@ class IdaMcpSessionManager(
                     runCatching { Os.chmod(binary.absolutePath, 493) }
                     materializeLogDir()
 
-                    if (isTcpOpen(launchSettings.port)) {
-                        val running = runningState(launchSettings, "IDA MCP HTTP 已在端口 ${launchSettings.port} 运行")
-                        _state.update { running }
-                        return@runCatching running
+                    if (isTcpOpen(launchSettings.port, launchSettings.bindHost)) {
+                        // Port is open. If it is our own live process bound to
+                        // the same endpoint we are already running; otherwise a
+                        // stale process from a previous session holds the port,
+                        // so clean it up and start fresh instead of reporting a
+                        // phantom "running".
+                        if (activeProcess?.isAlive == true && activeProcessBind == launchSettings.bind) {
+                            val running = runningState(launchSettings, "IDA MCP HTTP 已在端口 ${launchSettings.port} 运行")
+                            _state.update { running }
+                            return@runCatching running
+                        }
+                        runCatching { runtime.run(buildStopCommand(launchSettings), timeoutMs = 15_000) }
+                        if (!waitUntilPortClosed(launchSettings.port, timeoutMs = 10_000, bindHost = launchSettings.bindHost)) {
+                            // The port is still held by something we cannot stop
+                            // (e.g. a non-MCP process). Starting a replacement
+                            // would bind-fail while waitUntilTcpOpen would
+                            // falsely report success against the foreign port.
+                            val errorState = IdaMcpSessionState(
+                                status = IdaMcpStatus.Error,
+                                settings = launchSettings,
+                                endpoint = launchSettings.endpoint,
+                                message = "IDA MCP 端口 ${launchSettings.port} 被其它进程占用且无法清理，请先释放端口",
+                                startedAt = System.currentTimeMillis()
+                            )
+                            _state.update { errorState }
+                            throw IllegalStateException(errorState.message)
+                        }
                     }
 
                     _state.update { IdaMcpSessionState(
@@ -170,10 +195,17 @@ class IdaMcpSessionManager(
                         .also { it.environment().putAll(spec.environment) }
                         .start()
                     activeProcess = process
+                    activeProcessBind = launchSettings.bind
                     pumpProcessOutput(process, logFile())
 
-                    val ready = waitUntilTcpOpen(launchSettings.port, timeoutMs = 30_000)
+                    val ready = waitUntilMcpReady(process, launchSettings.port, launchSettings.bindHost, timeoutMs = 30_000)
                     if (!ready) {
+                        // Tear down the half-started process so it cannot keep
+                        // holding the port or linger as a zombie.
+                        runCatching { process.destroy() }
+                        if (!process.waitFor(2, TimeUnit.SECONDS)) runCatching { process.destroyForcibly() }
+                        activeProcess = null
+                        activeProcessBind = null
                         val logTail = readLogTail(60).ifBlank { "暂无 ida-mcp-http.log" }
                         val errorState = IdaMcpSessionState(
                             status = IdaMcpStatus.Error,
@@ -228,6 +260,7 @@ class IdaMcpSessionManager(
                         }
                     }
                     activeProcess = null
+                    activeProcessBind = null
                     val result = runtime.run(buildStopCommand(settings), timeoutMs = 15_000)
                     if (result.exitCode != 0 && !result.timedOut) {
                         throw IllegalStateException(result.stderr.ifBlank { result.stdout }.ifBlank { "停止命令失败" })
@@ -253,7 +286,7 @@ class IdaMcpSessionManager(
     suspend fun probe(): IdaMcpSessionState = withContext(Dispatchers.IO) {
         val settings = _state.value.settings
         val probed = when {
-            isTcpOpen(settings.port) -> runningState(settings, "IDA MCP 端口 ${settings.port} 已就绪")
+            isTcpOpen(settings.port, settings.bindHost) -> runningState(settings, "IDA MCP 端口 ${settings.port} 已就绪")
             activeProcess?.isAlive == true -> IdaMcpSessionState(
                 status = IdaMcpStatus.Starting,
                 settings = settings,
@@ -326,18 +359,103 @@ class IdaMcpSessionManager(
         """.trimIndent()
     }
 
-    private fun isTcpOpen(port: Int): Boolean = runCatching {
-        Socket().use { socket ->
-            socket.connect(InetSocketAddress("127.0.0.1", port), 350)
-            true
+    /** bindHost → 本地探测主机列表（通配/0.0.0.0 → 127.0.0.1；:: → ::1）。 */
+    private fun probeHosts(bindHost: String?): List<String> {
+        // bindHost 默认从当前会话设置取，避免服务绑定到 IPv6 回环(::1)等
+        // 非 127.0.0.1 地址时误判为不可达（导致反复重启/销毁）。
+        val configured = (bindHost ?: _state.value.settings.bindHost).trim().trim('[', ']')
+        return when {
+            configured.isBlank() || configured == "0.0.0.0" || configured == "*" ->
+                listOf("127.0.0.1")
+            configured == "::" -> listOf("::1")
+            configured.contains(':') -> listOf(configured) // IPv6 literal
+            else -> listOf(configured)
         }
-    }.getOrDefault(false)
+    }
 
-    private suspend fun waitUntilTcpOpen(port: Int, timeoutMs: Long): Boolean {
+    private fun isTcpOpen(port: Int, bindHost: String? = null): Boolean =
+        probeHosts(bindHost).any { host ->
+            runCatching {
+                Socket().use { socket ->
+                    socket.connect(InetSocketAddress(host, port), 350)
+                    true
+                }
+            }.getOrDefault(false)
+        }
+
+    private suspend fun waitUntilTcpOpen(port: Int, timeoutMs: Long, bindHost: String? = null): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
-            if (isTcpOpen(port)) return true
+            if (isTcpOpen(port, bindHost)) return true
             delay(500)
+        }
+        return false
+    }
+    /**
+     * MCP 就绪判定：不能只依赖端口开放 —— 若别的进程抢占了该端口，waitUntilTcpOpen
+     * 会误报就绪而真正的 MCP 进程 bind 失败退出。要求：
+     * 1. 由我们启动的进程仍然存活（bind 失败/提前退出 → 立即判定未就绪）；
+     * 2. 端口 TCP 开放；
+     * 3. 端口上有 HTTP 响应（MCP 是 HTTP 服务，任意 TCP 监听者不会应答）。
+     */
+    private suspend fun waitUntilMcpReady(
+        process: Process,
+        port: Int,
+        bindHost: String,
+        timeoutMs: Long
+    ): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        var tcpOpenSince = -1L
+        while (System.currentTimeMillis() < deadline) {
+            // 由我们启动的进程提前退出（例如 bind 失败）→ 立即判定未就绪，
+            // 防止把其它进程抢占的端口误报为 MCP 就绪。
+            if (!process.isAlive) return false
+            val open = isTcpOpen(port, bindHost)
+            if (open) {
+                if (tcpOpenSince < 0) tcpOpenSince = System.currentTimeMillis()
+                // MCP 特定 HTTP 应答优先；若 HTTP 层探测端点不被支持（连接被重置/
+                // 超时），在进程存活且端口已稳定开放一段时间后也视为就绪 ——
+                // 否则会把正常启动的 MCP 误杀（30 秒超时 → destroy → 反复重启）。
+                val httpOk = isMcpHttpResponding(port, bindHost)
+                val stable = System.currentTimeMillis() - tcpOpenSince >= 8_000
+                if (httpOk || stable) return true
+            } else {
+                tcpOpenSince = -1L
+            }
+            delay(500)
+        }
+        return false
+    }
+
+    /** MCP HTTP 探测端点候选（按顺序尝试，任一返回 HTTP 状态即视为应答）。 */
+    private val mcpProbePaths = listOf("/", "/api/health", "/api/transfers")
+
+    /** 探测端口上的 HTTP 服务是否应答（任意 2xx/3xx/4xx/5xx 均视为有 HTTP 服务）。 */
+    private fun isMcpHttpResponding(port: Int, bindHost: String): Boolean =
+        probeHosts(bindHost).any { host ->
+            mcpProbePaths.any { probePath ->
+                runCatching {
+                    val urlHost = if (host.contains(':')) "[$host]" else host
+                    val conn = (URL("http://$urlHost:$port$probePath").openConnection() as HttpURLConnection).apply {
+                        requestMethod = "GET"
+                        connectTimeout = 1200
+                        readTimeout = 1200
+                    }
+                    try {
+                        val code = conn.responseCode
+                        code >= 200 && code < 600
+                    } finally {
+                        conn.disconnect()
+                    }
+                }.getOrDefault(false)
+            }
+        }
+
+    private suspend fun waitUntilPortClosed(port: Int, timeoutMs: Long, bindHost: String? = null): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (!isTcpOpen(port, bindHost)) return true
+            delay(300)
         }
         return false
     }
@@ -352,13 +470,21 @@ class IdaMcpSessionManager(
             file.appendText("\n== ${Instant.now()} IDA MCP supervisor started pid=${process.safePid() ?: "unknown"} ==\n")
         }
         Thread {
-            process.inputStream.bufferedReader().useLines { lines ->
-                lines.forEach { logLine("stdout", it) }
+            try {
+                process.inputStream.bufferedReader().useLines { lines ->
+                    lines.forEach { logLine("stdout", it) }
+                }
+            } catch (_: java.io.IOException) {
+                // Stream closed by process teardown (stop/destroy); reading is done.
             }
         }.apply { name = "idadroid-mcp-stdout"; isDaemon = true; start() }
         Thread {
-            process.errorStream.bufferedReader().useLines { lines ->
-                lines.forEach { logLine("stderr", it) }
+            try {
+                process.errorStream.bufferedReader().useLines { lines ->
+                    lines.forEach { logLine("stderr", it) }
+                }
+            } catch (_: java.io.IOException) {
+                // Stream closed by process teardown (stop/destroy); reading is done.
             }
         }.apply { name = "idadroid-mcp-stderr"; isDaemon = true; start() }
     }
@@ -368,9 +494,12 @@ class IdaMcpSessionManager(
         paths.logsDir.mkdirs()
     }
 
-    private fun logFile(): File = File(paths.logsDir, "ida-mcp-http.log")
+    fun logFile(): File = File(paths.logsDir, "ida-mcp-http.log")
 
     @Volatile private var activeProcess: Process? = null
+
+    /** Bind endpoint ("host:port") the active process was launched with. */
+    @Volatile private var activeProcessBind: String? = null
 
     // ==================== Health Monitor / Watchdog ====================
 
@@ -381,7 +510,14 @@ class IdaMcpSessionManager(
      */
     fun setMonitoringEnabled(enabled: Boolean) {
         monitoringEnabled = enabled
-        if (!enabled) stopWatchdog()
+        if (!enabled) {
+            stopWatchdog()
+        } else if (_state.value.status == IdaMcpStatus.Running && activeProcess?.isAlive == true) {
+            // 服务已在运行但 watchdog 之前被关闭（例如启动时监控被禁用）：
+            // 重新启用后立即启动监控循环，否则正在运行的服务将不再被守护。
+            startWatchdog(_state.value.settings)
+        }
+        _state.update { it.copy(monitoringEnabled = enabled) }
     }
 
     fun isMonitoringEnabled(): Boolean = monitoringEnabled
@@ -391,10 +527,13 @@ class IdaMcpSessionManager(
         val process = activeProcess
         val settings = _state.value.settings
         val alive = process?.isAlive == true
-        val portOpen = isTcpOpen(settings.port)
+        val portOpen = isTcpOpen(settings.port, settings.bindHost)
         val ok = alive && portOpen
+        val now = System.currentTimeMillis()
         lastHealthOk = ok
-        lastHealthCheckAt = System.currentTimeMillis()
+        lastHealthCheckAt = now
+        // 同步发布健康结果到 state，避免 UI 看到过期的 lastHealthOk/lastHealthCheckAt
+        _state.update { it.copy(lastHealthOk = ok, lastHealthCheckAt = now) }
         if (!ok && _state.value.status == IdaMcpStatus.Running) {
             _state.update { it.copy(
                 status = IdaMcpStatus.Error,
@@ -413,9 +552,12 @@ class IdaMcpSessionManager(
                 try {
                     val process = activeProcess
                     val alive = process?.isAlive == true
-                    val portOpen = isTcpOpen(settings.port)
-                    lastHealthCheckAt = System.currentTimeMillis()
+                    val portOpen = isTcpOpen(settings.port, settings.bindHost)
+                    val now = System.currentTimeMillis()
+                    lastHealthCheckAt = now
                     lastHealthOk = alive && portOpen
+                    // 同步发布健康结果到 state，避免 UI 一直显示旧健康状态
+                    _state.update { it.copy(lastHealthOk = lastHealthOk, lastHealthCheckAt = now) }
 
                     if (!alive || !portOpen) {
                         // Process died or port stopped responding while we think
@@ -447,6 +589,22 @@ class IdaMcpSessionManager(
     companion object {
         private val startStopMutex = Mutex()
         private const val WATCHDOG_INTERVAL_MS = 15_000L
+
+        @Volatile
+        private var instance: IdaMcpSessionManager? = null
+
+        /**
+         * Process-wide singleton. Home UI and the floating window must share
+         * one manager (state, settings and the launched process), otherwise
+         * each surface starts its own MCP with its own settings and neither
+         * reflects the other's real state.
+         */
+        fun get(context: Context, settingsStore: dev.idadroid.settings.IdaDroidSettings? = null): IdaMcpSessionManager {
+            instance?.let { return it }
+            return synchronized(this) {
+                instance ?: IdaMcpSessionManager(context.applicationContext, settingsStore = settingsStore).also { instance = it }
+            }
+        }
     }
 }
 

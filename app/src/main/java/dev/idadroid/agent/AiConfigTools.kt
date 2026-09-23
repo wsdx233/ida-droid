@@ -8,10 +8,11 @@ import java.net.URL
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 
 /**
  * 配置导入导出 + API 连接测试 + 模型列表拉取。
@@ -231,15 +232,15 @@ class AiConfigTools(
             when (providerId) {
                 "google" -> {
                     // Gemini: { "models": [{ "name": "models/gemini-2.0-flash", ... }] }
-                    parsed["models"]?.jsonArray?.mapNotNull { model ->
-                        val name = model.jsonObject["name"]?.jsonPrimitive?.contentOrNull
-                        name?.removePrefix("models/")
+                    (parsed["models"] as? JsonArray)?.mapNotNull { model ->
+                        val name = (model as? JsonObject)?.get("name") as? JsonPrimitive
+                        name?.contentOrNull?.removePrefix("models/")
                     } ?: emptyList()
                 }
                 else -> {
                     // OpenAI compatible: { "data": [{ "id": "gpt-4o", ... }] }
-                    parsed["data"]?.jsonArray?.mapNotNull { model ->
-                        model.jsonObject["id"]?.jsonPrimitive?.contentOrNull
+                    (parsed["data"] as? JsonArray)?.mapNotNull { model ->
+                        ((model as? JsonObject)?.get("id") as? JsonPrimitive)?.contentOrNull
                     } ?: emptyList()
                 }
             }
@@ -261,8 +262,8 @@ class AiConfigTools(
 
     private fun extractErrorMessage(body: String): String? = try {
         val parsed = JsonFormats.pretty.parseToJsonElement(body).jsonObject
-        parsed["error"]?.jsonObject?.get("message")?.jsonPrimitive?.contentOrNull
-            ?: parsed["message"]?.jsonPrimitive?.contentOrNull
+        (((parsed["error"] as? JsonObject)?.get("message")) as? JsonPrimitive)?.contentOrNull
+            ?: (parsed["message"] as? JsonPrimitive)?.contentOrNull
     } catch (e: Exception) {
         android.util.Log.w("AiConfigTools", "错误消息解析失败: ${e.message}")
         null

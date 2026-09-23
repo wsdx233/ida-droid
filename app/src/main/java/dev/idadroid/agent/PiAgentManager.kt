@@ -19,6 +19,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlin.coroutines.coroutineContext
+import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
@@ -68,6 +69,8 @@ class PiAgentManager(
         compactor = { messages -> generateLlmSummary(messages.map { it.toUiMessage() }, null) }
     }
     @Volatile private var currentSendJob: Job? = null
+    /** ConversationEngine 当前上下文归属的会话 id（引擎全局共享，切换会话时必须 reset/恢复）。 */
+    @Volatile private var engineSessionId: String? = null
 
     private val _state = MutableStateFlow(AgentUiState(activity = "agent 未启动"))
     val state: StateFlow<AgentUiState> = _state.asStateFlow()
@@ -81,43 +84,52 @@ class PiAgentManager(
             _state.update { AgentUiState(activity = "rootfs 未导入") }
             return
         }
-        // 文件 IO 切到 IO 线程，避免主线程阻塞
+        // 文件 IO 切到 IO 线程；任何一步失败只更新错误状态，绝不能让
+        // 启动链路（IdaDroidApp LaunchedEffect → refresh）的未捕获异常杀死进程。
         scope.launch {
-            val store = repo.loadStore()
-            val snapshot = configManager.readSnapshot()
-            val defaultPair = if (createDefaultIfReady && store.sessions.isEmpty()) resolveDefaultModel(snapshot) else null
-            val defaultProvider = defaultPair?.provider ?: snapshot.defaultProvider.trim().takeIf { it.isNotBlank() }
-            val defaultModel = defaultPair?.id ?: snapshot.defaultModel.trim().takeIf { it.isNotBlank() }
-            val defaultThinking = snapshot.defaultThinkingLevel.trim().takeIf { it.isNotBlank() }
-            val active = when {
-                store.activeSessionId != null && store.sessions.any { it.id == store.activeSessionId } -> store.activeSessionId
-                store.sessions.isNotEmpty() -> store.sessions.first().id
-                createDefaultIfReady -> repo.ensureDefaultSession(
-                    provider = defaultProvider,
-                    model = defaultModel,
-                    thinkingLevel = defaultThinking
-                ).id
-                else -> null
-            }
-            val sessions = store.sessions
-            _state.update { old ->
-                val activeSession = sessions.firstOrNull { it.id == active }
-                old.copy(
-                    sessions = sessions,
-                    activeSessionId = active,
-                    status = activeSession?.status ?: "idle",
-                    error = activeSession?.error,
-                    modelLabel = modelLabel(activeSession),
-                    piConfig = snapshot,
-                    activity = if (active == null) "点击新建 Session 开始" else old.activity,
-                    workspace = old.workspace.copy(
-                        hasWorkspace = workspaceManager.hasWorkspace,
-                        workspaceName = workspaceManager.currentWorkspaceName,
-                        workspaceUri = workspaceManager.currentWorkspaceUri?.toString().orEmpty()
+            dev.idadroid.util.runCatchingSuspending {
+                val loaded = withContext(Dispatchers.IO) {
+                    val store = repo.loadStore()
+                    val snapshot = configManager.readSnapshot()
+                    val defaultPair = if (createDefaultIfReady && store.sessions.isEmpty()) resolveDefaultModel(snapshot) else null
+                    Triple(store, snapshot, defaultPair)
+                }
+                val (store, snapshot, defaultPair) = loaded
+                val defaultProvider = defaultPair?.provider ?: snapshot.defaultProvider.trim().takeIf { it.isNotBlank() }
+                val defaultModel = defaultPair?.id ?: snapshot.defaultModel.trim().takeIf { it.isNotBlank() }
+                val defaultThinking = snapshot.defaultThinkingLevel.trim().takeIf { it.isNotBlank() }
+                val active = when {
+                    store.activeSessionId != null && store.sessions.any { it.id == store.activeSessionId } -> store.activeSessionId
+                    store.sessions.isNotEmpty() -> store.sessions.first().id
+                    createDefaultIfReady -> repo.ensureDefaultSession(
+                        provider = defaultProvider,
+                        model = defaultModel,
+                        thinkingLevel = defaultThinking
+                    ).id
+                    else -> null
+                }
+                val sessions = store.sessions
+                _state.update { old ->
+                    val activeSession = sessions.firstOrNull { it.id == active }
+                    old.copy(
+                        sessions = sessions,
+                        activeSessionId = active,
+                        status = activeSession?.status ?: "idle",
+                        error = activeSession?.error,
+                        modelLabel = modelLabel(activeSession),
+                        piConfig = snapshot,
+                        activity = if (active == null) "点击新建 Session 开始" else old.activity,
+                        workspace = old.workspace.copy(
+                            hasWorkspace = workspaceManager.hasWorkspace,
+                            workspaceName = workspaceManager.currentWorkspaceName,
+                            workspaceUri = workspaceManager.currentWorkspaceUri?.toString().orEmpty()
+                        )
                     )
-                )
+                }
+                active?.let { loadMessages(it) }
+            }.onFailure { error ->
+                _state.update { it.copy(error = "刷新 Agent 状态失败：${error.message}", activity = "刷新失败") }
             }
-            active?.let { loadMessages(it) }
         }
     }
 
@@ -134,7 +146,7 @@ class PiAgentManager(
                     thinkingLevel = configManager.defaultThinking()
                 )
             }.onSuccess { session ->
-                refresh()
+                // selectSession 内部会先把引擎从旧会话切走（abort + bind + loadMessages）
                 selectSession(session.id)
             }.onFailure { error -> setError("新建 Session 失败：${error.message}") }
         }
@@ -142,12 +154,26 @@ class PiAgentManager(
 
     fun selectSession(id: String) {
         scope.launch {
-            runCatching { repo.setActive(id) }
-                .onSuccess {
-                    refresh()
-                    loadMessages(id)
+            try {
+                // 切换会话前先中止/收尾旧会话的发送，避免引擎上下文串写
+                val current = _state.value.activeSessionId
+                if (current != null && current != id && _state.value.turnActive) {
+                    runCatching { abortSession(current) }
                 }
-                .onFailure { error -> setError("切换 Session 失败：${error.message}") }
+                // 先把引擎绑定到目标会话（必要时持久化旧会话并从文件恢复历史）。
+                // 绑定成功后才提交 active：若这里失败（读历史文件异常等），store 仍保持
+                // 旧 active，不会出现"store 已切换但引擎丢失目标历史"的错位。
+                val session = repo.listSessions().firstOrNull { it.id == id }
+                    ?: error("session 不存在：$id")
+                val convConfig = session.let { resolveConvConfig(it.id, it) }
+                bindEngineToSession(id, convConfig)
+                repo.setActive(id)
+            } catch (e: Exception) {
+                setError("切换 Session 失败：${e.message}")
+                return@launch
+            }
+            refresh()
+            loadMessages(id)
         }
     }
 
@@ -165,8 +191,14 @@ class PiAgentManager(
             runCatching {
                 conversationEngine.abort()
                 repo.deleteSession(id)
-            }.onSuccess { refresh(createDefaultIfReady = true) }
-                .onFailure { error -> setError("删除 Session 失败：${error.message}") }
+            }.onSuccess {
+                // 删除的是引擎当前绑定的会话 → 清空引擎，等待下一个会话重新 bind
+                if (engineSessionId == id) {
+                    dev.idadroid.util.runCatchingSuspending { conversationEngine.reset() }
+                    engineSessionId = null
+                }
+                refresh(createDefaultIfReady = true)
+            }.onFailure { error -> setError("删除 Session 失败：${error.message}") }
         }
     }
 
@@ -250,6 +282,9 @@ class PiAgentManager(
 
                 try {
                     kotlinx.coroutines.withTimeout(PROMPT_TIMEOUT_MS) {
+                        // 发送前把引擎绑定到当前会话：应用重启/切换会话后引擎可能为空或
+                        // 属于其它会话，需要先从该会话文件恢复历史，否则对话会丢失上下文
+                        bindEngineToSession(sessionId, convConfig)
                         val imageUris = expanded.images.map { img ->
                             "data:${img.mimeType};base64,${img.data}"
                         }
@@ -285,29 +320,91 @@ class PiAgentManager(
     fun abort(id: String? = null) {
         scope.launch {
             val sessionId = id ?: _state.value.activeSessionId ?: return@launch
-            // 标记：后续收到的 abort 相关错误事件静默处理
-            suppressAbortError = true
-            // 新架构：cancel sendJob 让 ConversationEngine.send() 的流收集中断
-            currentSendJob?.let { job ->
-                job.cancel()
-                try { job.join() } catch (_: kotlinx.coroutines.CancellationException) {}
-            }
-            currentSendJob = null
-            conversationEngine.abort()
-            finishStreamingFlush()
-            setTurnActive(sessionId, false)
-            repo.updateRuntimeStatus(sessionId, "running", null)
+            abortSession(sessionId)
         }
+    }
+
+    /** abort 的实际逻辑（可在切换会话前同步调用）。 */
+    private suspend fun abortSession(sessionId: String) {
+        // 标记：后续收到的 abort 相关错误事件静默处理
+        suppressAbortError = true
+        // 新架构：cancel sendJob 让 ConversationEngine.send() 的流收集中断
+        currentSendJob?.let { job ->
+            job.cancel()
+            try { job.join() } catch (_: kotlinx.coroutines.CancellationException) {}
+        }
+        currentSendJob = null
+        conversationEngine.abort()
+        finishStreamingFlush()
+        setTurnActive(sessionId, false)
+        repo.updateRuntimeStatus(sessionId, "running", null)
     }
 
     fun loadMessages(id: String? = null) {
         scope.launch {
             val sessionId = id ?: _state.value.activeSessionId ?: return@launch
             _state.update { it.copy(messagesLoading = true) }
-            val messages = withContext(Dispatchers.IO) { loadMessagesInternal(sessionId) }
-            _state.update { it.copy(messages = messages, messagesLoading = false) }
+            try {
+                val session = repo.listSessions().firstOrNull { it.id == sessionId }
+                val convConfig = session?.let { resolveConvConfig(it.id, it) }
+                // 引擎绑定失败（历史文件读取异常）不阻塞展示：loadMessagesInternal 会回退读文件
+                runCatching { bindEngineToSession(sessionId, convConfig) }
+                val messages = withContext(Dispatchers.IO) { loadMessagesInternal(sessionId) }
+                _state.update { it.copy(messages = messages, messagesLoading = false) }
+            } catch (e: Exception) {
+                setError("加载消息失败：${e.message}")
+                _state.update { it.copy(messagesLoading = false) }
+            }
         }
     }
+
+    /**
+     * 把 ConversationEngine 的全局上下文绑定到指定会话：
+     * 切换会话时先把旧上下文持久化到旧会话文件，重置引擎，再从目标会话
+     * 文件恢复历史消息。这样每个会话的消息互相隔离，不再"新建会话却显示
+     * 上一个会话的内容"。调用方需保证当前没有正在运行的 send（切换前 abort）。
+     *
+     * 注意：目标历史文件的读取放在任何引擎状态变更之前 —— 若读取失败会抛异常，
+     * 引擎与 engineSessionId 均保持不变，调用方（如 selectSession）可以放弃切换，
+     * 不会出现"store 已切到目标会话但引擎丢失目标历史"的错位。
+     */
+    private suspend fun bindEngineToSession(sessionId: String, config: ConversationConfig?) {
+        val bound = engineSessionId
+        if (bound == sessionId) return
+        // 先读目标会话的历史（可能抛 IOException），确认能恢复再动引擎
+        var dtos = emptyList<ChatHttpClient.ChatMessageDto>()
+        if (config != null) {
+            val session = repo.listSessions().firstOrNull { it.id == sessionId }
+            val sessionFile = session?.sessionFile ?: defaultSessionFilePath(sessionId)
+            val file = sessionFileToHostFile(sessionFile)?.takeIf { it.isFile }
+            if (file != null) {
+                dtos = withContext(Dispatchers.IO) {
+                    file.readLines().mapNotNull { line ->
+                        val trimmed = line.trim()
+                        if (trimmed.isBlank()) null
+                        else runCatching { json.decodeFromString<ChatHttpClient.ChatMessageDto>(trimmed) }.getOrNull()
+                    }
+                }
+            }
+        }
+        // 引擎里残留其它会话的上下文 → 先写回它的会话文件，避免丢失
+        if (bound != null && conversationEngine.getMessages().isNotEmpty()) {
+            persistMessages(bound)
+        }
+        conversationEngine.reset()
+        // 仅当配置可用（能恢复历史或确认空会话）时才标记引擎已绑定该会话。
+        // config == null（例如尚未配置 API Key）时保持未绑定，让之后配置就绪的
+        // send/loadMessages 能重新进入本方法并加载文件历史 —— 否则 send 会因
+        // engineSessionId == sessionId 提前返回，引擎空转导致历史永久丢失。
+        engineSessionId = if (config != null) sessionId else null
+        if (dtos.isNotEmpty() && config != null) {
+            conversationEngine.restoreFromMessages(dtos, config)
+        }
+    }
+
+    /** 会话消息文件（proot 路径，缺省在 workspace 的 .idadroid/sessions 下）。 */
+    private fun defaultSessionFilePath(sessionId: String): String =
+        "$workspaceProotPath/.idadroid/sessions/${sessionId}.jsonl"
 
     /**
      * 持久化对话历史到 session 文件。
@@ -319,14 +416,17 @@ class PiAgentManager(
             if (messages.isEmpty()) return
             withContext(Dispatchers.IO) {
                 val session = repo.listSessions().firstOrNull { it.id == sessionId } ?: return@withContext
-                // sessionFile 为空时创建默认路径
-                val sessionFile = session.sessionFile ?: "$workspaceProotPath/.idadroid/sessions/${sessionId}.jsonl"
+                // sessionFile 为空时创建默认路径，并回写到 session 记录便于后续恢复
+                val sessionFile = session.sessionFile ?: defaultSessionFilePath(sessionId)
                 val file = sessionFileToHostFile(sessionFile) ?: return@withContext
                 file.parentFile?.mkdirs()
                 // 每条消息一行 JSON，便于增量读取和恢复
                 file.writeText(messages.joinToString("\n") { msg ->
                     json.encodeToString(ChatHttpClient.ChatMessageDto.serializer(), msg)
                 } + "\n")
+                if (session.sessionFile.isNullOrBlank()) {
+                    repo.setSessionFile(sessionId, sessionFile)
+                }
             }
         } catch (e: Exception) {
             android.util.Log.w("PiAgentManager", "消息持久化失败: ${e.message}")
@@ -806,19 +906,31 @@ class PiAgentManager(
     private fun newMessageId(): String = java.util.UUID.randomUUID().toString()
 
     private suspend fun loadMessagesInternal(sessionId: String): List<ChatMessage> {
-        // 新架构：从 ConversationEngine 获取当前消息
-        val convMessages = conversationEngine.getMessages()
-        if (convMessages.isNotEmpty()) {
-            return convMessages.toUiMessages()
+        // 引擎已绑定该会话且内存有消息 → 直接用引擎快照（含本轮未落盘内容）
+        if (engineSessionId == sessionId) {
+            val convMessages = conversationEngine.getMessages()
+            if (convMessages.isNotEmpty()) {
+                return convMessages.toUiMessages()
+            }
         }
-        // 回退：从 session file 读取（旧数据兼容）
+        // 回退：从该会话的 session 文件读取（新版为 ChatMessageDto JSONL；
+        // 兼容旧 pi-agent 格式 JSON）
         val session = repo.listSessions().firstOrNull { it.id == sessionId } ?: return emptyList()
-        val file = session.sessionFile?.let(::sessionFileToHostFile)?.takeIf { it.isFile } ?: return emptyList()
-        val messages = file.readLines().mapNotNull { line ->
+        val sessionFile = session.sessionFile ?: defaultSessionFilePath(sessionId)
+        val file = sessionFileToHostFile(sessionFile)?.takeIf { it.isFile } ?: return emptyList()
+        val lines = file.readLines()
+        val dtos = lines.mapNotNull { line ->
+            val trimmed = line.trim()
+            if (trimmed.isBlank()) null
+            else runCatching { json.decodeFromString<ChatHttpClient.ChatMessageDto>(trimmed) }.getOrNull()
+        }
+        if (dtos.isNotEmpty()) return dtos.toUiMessages()
+        // 旧 pi 格式兼容
+        val elements = lines.mapNotNull { line ->
             val trimmed = line.trim()
             if (trimmed.isBlank()) null else runCatching { json.parseToJsonElement(trimmed) }.getOrNull()
         }
-        return normalizePiMessages(messages)
+        return normalizePiMessages(elements)
     }
 
     private fun sessionFileToHostFile(sessionFile: String): File? {

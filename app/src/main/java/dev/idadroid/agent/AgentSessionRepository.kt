@@ -12,11 +12,24 @@ class AgentSessionRepository(
     private val paths: EnvironmentPaths
 ) {
     private val settings = dev.idadroid.settings.IdaDroidSettings(context.applicationContext)
-    private val storeFile: java.io.File get() {
-        val ws = settings.envSettings.value.workspacePath.ifBlank { dev.idadroid.settings.IdaDroidSettings.DEFAULT_WORKSPACE_PATH }
-        val rel = ws.removePrefix("/").ifBlank { "root/pi_workspace" }
-        return java.io.File(paths.rootfsDir, "$rel/.idadroid/agent-sessions.json")
+
+    private val workspaceProotPath: String
+        get() = settings.envSettings.value.workspacePath.ifBlank { dev.idadroid.settings.IdaDroidSettings.DEFAULT_WORKSPACE_PATH }
+
+    /**
+     * 工作区在主机文件系统上的根目录。
+     * 与 PiAgentManager.workspaceHostRoot / AttachmentManager 保持同一规则：
+     * /root/xxx 在 rootfs 内；/sdcard、/storage 前缀由 proot 绑定，直接使用宿主同路径。
+     */
+    private val workspaceHostRoot: java.io.File get() {
+        val ws = workspaceProotPath
+        if (ws.startsWith("/root/")) return java.io.File(paths.rootfsDir, ws.removePrefix("/"))
+        if (ws.startsWith("/sdcard") || ws.startsWith("/storage")) return java.io.File(ws)
+        return java.io.File(paths.rootfsDir, ws.removePrefix("/").ifBlank { "root/pi_workspace" })
     }
+
+    private val storeFile: java.io.File get() = java.io.File(workspaceHostRoot, ".idadroid/agent-sessions.json")
+
     // Protects all read/write access to storeFile so that concurrent coroutines don't race.
     private val lock = Any()
 
@@ -29,17 +42,29 @@ class AgentSessionRepository(
         }.getOrDefault(AgentSessionStore())
     }
 
-    fun saveStore(store: AgentSessionStore) = synchronized(lock) { saveStoreInternal(store) }
+    fun saveStore(store: AgentSessionStore) { saveStoreInternal(store) }
 
-    private fun saveStoreInternal(store: AgentSessionStore) = synchronized(lock) {
-        storeFile.parentFile?.mkdirs()
-        val tmp = java.io.File(storeFile.parentFile, "${storeFile.name}.tmp")
-        tmp.writeText(JsonFormats.pretty.encodeToString(store))
-        if (!tmp.renameTo(storeFile)) {
-            // renameTo 在某些文件系统上可能失败（如目标被占用），回退到 copy+delete
-            storeFile.writeText(tmp.readText())
-            tmp.delete()
-        }
+    /** 写盘；失败返回 false（调用方决定抛错或降级）。 */
+    private fun saveStoreInternal(store: AgentSessionStore): Boolean = synchronized(lock) {
+        runCatching {
+            val file = storeFile
+            file.parentFile?.mkdirs()
+            val tmp = java.io.File(file.parentFile, "${file.name}.tmp")
+            tmp.writeText(JsonFormats.pretty.encodeToString(store))
+            if (!tmp.renameTo(file)) {
+                // renameTo 在某些文件系统上可能失败（如目标被占用），回退到 copy+delete
+                file.writeText(tmp.readText())
+                tmp.delete()
+            }
+            true
+        }.onFailure { error ->
+            android.util.Log.w("AgentSessionRepository", "保存 agent 会话失败（路径=${storeFile.absolutePath}）", error)
+        }.getOrDefault(false)
+    }
+
+    /** 写盘失败即抛错，让上层把"会话未保存"如实反馈给用户，而不是 UI 看似成功实则无变化。 */
+    private fun requireSaved(saved: Boolean) {
+        check(saved) { "会话状态保存失败：${storeFile.absolutePath} 不可写" }
     }
 
     fun listSessions(): List<AgentSessionRecord> = loadStore().sessions
@@ -57,6 +82,7 @@ class AgentSessionRepository(
             )
             val nextSessions = if (patched == existing) store.sessions else store.sessions.map { if (it.id == existing.id) patched else it }
             if (store.activeSessionId == existing.id && patched == existing) return@synchronized existing
+            // 自动兜底路径：静默保存失败，由后续显式操作（新建/切换）如实报错
             saveStoreInternal(store.copy(sessions = nextSessions, activeSessionId = existing.id))
             return@synchronized patched
         }
@@ -72,6 +98,7 @@ class AgentSessionRepository(
             createdAt = now,
             updatedAt = now
         )
+        // 自动兜底路径：静默保存失败，由后续显式操作（新建/切换）如实报错
         saveStoreInternal(AgentSessionStore(listOf(session), session.id))
         session
     }
@@ -90,14 +117,14 @@ class AgentSessionRepository(
             createdAt = now,
             updatedAt = now
         )
-        saveStoreInternal(store.copy(sessions = store.sessions + session, activeSessionId = session.id))
+        requireSaved(saveStoreInternal(store.copy(sessions = store.sessions + session, activeSessionId = session.id)))
         session
     }
 
     fun setActive(id: String): AgentSessionRecord = synchronized(lock) {
         val store = loadStoreInternal()
         val session = store.sessions.firstOrNull { it.id == id } ?: error("session 不存在：$id")
-        saveStoreInternal(store.copy(activeSessionId = id))
+        requireSaved(saveStoreInternal(store.copy(activeSessionId = id)))
         session
     }
 
@@ -110,7 +137,7 @@ class AgentSessionRepository(
             } else current
         }
         val result = updated ?: error("session 不存在：$id")
-        saveStoreInternal(store.copy(sessions = sessions, activeSessionId = store.activeSessionId ?: id))
+        requireSaved(saveStoreInternal(store.copy(sessions = sessions, activeSessionId = store.activeSessionId ?: id)))
         result
     }
 
@@ -122,7 +149,7 @@ class AgentSessionRepository(
             nextSessions.isNotEmpty() -> nextSessions.first().id
             else -> null
         }
-        saveStoreInternal(store.copy(sessions = nextSessions, activeSessionId = nextActive))
+        requireSaved(saveStoreInternal(store.copy(sessions = nextSessions, activeSessionId = nextActive)))
     }
 
     fun updateRuntimeStatus(id: String, status: String, error: String? = null): AgentSessionRecord? = runCatching {
