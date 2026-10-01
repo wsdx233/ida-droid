@@ -33,107 +33,61 @@ IDADROID_RELEASE_KEY_PASSWORD=***
 
 详见 [架构文档](architecture.md)。
 
-## AI 对话引擎开发指南
+## PI Agent 开发指南
 
-### 添加新的 LLM Provider
+### 添加新的 Provider / Model
 
-1. 在 `models.json` 中添加 provider 配置：
+Provider 与模型由工作区私有的 `.idadroid/pi-agent/models.json` 管理，编辑入口是 Agent 配置页的可视化编辑器。`PiConfigManager.materialize()` 会把旧格式 `baseURL`/`envKey` 转成 PI 使用的 `baseUrl`/`api`/`apiKey`，并从 `env` 解析凭据；不要把密钥写入日志、诊断或提交到仓库。
 
 ```json
 {
   "providers": {
     "my-provider": {
-      "baseURL": "https://api.my-provider.com/v1",
-      "envKey": "MY_PROVIDER_API_KEY",
-      "label": "My Provider"
+      "baseUrl": "https://api.example.com/v1",
+      "api": "openai-completions",
+      "envKey": "MY_PROVIDER_API_KEY"
     }
-  },
-  "models": {
-    "my-provider": [
-      { "id": "my-model", "name": "My Model", "reasoning": false }
-    ]
   }
 }
 ```
 
-2. 如果 Provider 使用标准 OpenAI 兼容 API，无需额外代码。
-3. 如果 Provider 有特殊 API 格式，在 `ChatHttpClient` 中添加适配逻辑。
+PI 本身负责请求格式、重试、工具循环和 Provider 兼容性。Android 侧不应重新添加 HTTP 适配层；需要新增 RPC 能力时，先确认当前 PI 版本的命令/事件，再在 `PiAgentManager` 中加入带 timeout 的调用和状态更新。
 
-### 添加新的工具
+### 修改 Agent RPC
 
-1. 在 `ToolEventBus.kt` 的 `toolDefinitions()` 中添加工具定义：
+`PiRpcTransport` 是单进程、单 session generation 的 JSONL 传输层。请求必须通过 `request(type, fields, timeoutMs)` 发送，不要直接写 stdin。事件在 `PiAgentManager.handleEvent()` 中按 generation 和 active session 过滤。
 
-```kotlin
-add(JsonObject(mapOf(
-    "type" to JsonPrimitive("function"),
-    "function" to JsonObject(mapOf(
-        "name" to JsonPrimitive("my_tool"),
-        "description" to JsonPrimitive("My tool description"),
-        "parameters" to JsonObject(mapOf(
-            "type" to JsonPrimitive("object"),
-            "properties" to JsonObject(mapOf(
-                "input" to JsonObject(mapOf(
-                    "type" to JsonPrimitive("string"),
-                    "description" to JsonPrimitive("Input parameter")
-                ))
-            )),
-            "required" to JsonArray(listOf(JsonPrimitive("input")))
-        ))
-    ))
-)))
-```
+新增命令时必须同时考虑：
 
-2. 在 `execute()` 方法中添加执行逻辑：
+1. 成功响应和 `PiRpcCommandException` 的 UI 文案；
+2. timeout、EOF、坏 JSON、进程退出时的失败闭合；
+3. 是否影响 `turnActive`、`processingPhase`、队列或 session 持久化；
+4. 用户取消后是否清除 pending 状态，而不是一直显示 loading。
 
-```kotlin
-"my_tool" -> {
-    val input = args["input"]?.jsonPrimitive?.contentOrNull ?: return "错误: 缺少 input 参数"
-    // 执行工具逻辑
-    "结果: $input"
-}
-```
-
-3. 如需自定义成功/失败判断，在 `isToolResultSuccess()` 中添加规则。
+发送入口 `sendPrompt()` 是同步 admission，返回 `false` 表示消息尚未被接受，UI 必须保留草稿。只有返回 `true` 后才允许清空草稿；附件 materialize 在 IO dispatcher 执行。
 
 ### 修改 System Prompt
 
-System prompt 定义在 `PiConfigManager.kt` 的 `defaultSystemAppendPrompt()` 函数中。
+默认追加提示词位于 `PiConfigManager.kt` 的 `defaultSystemAppendPrompt()`。用户可在 Agent 配置页修改 `APPEND_SYSTEM.md`。提示词应只描述 IDAdroid 工作区、IDA/MCP 路径和安全边界；工具定义由 PI/扩展提供，不要在 Android 侧复制一份。
 
-**设计原则**:
-- 精简：只包含环境信息和核心准则，工具说明由 tool definitions 提供
-- 结构化：使用 markdown 标题分段
-- 可覆盖：用户可在 Pi 配置中自定义 `appendSystem`
+### Session 与历史
 
-### 修改上下文管理策略
-
-上下文管理在 `ConversationManager.kt` 中：
-
-- `contextTokenLimit`: 估算 token 上限（默认 32K）
-- `trimContextIfNeeded()`: 自动截断逻辑
-- `estimateTokens()`: token 估算（chars/3）
-- `PiAgentManager.compact()`: 手动压缩逻辑
+`AgentSessionRepository` 负责 `.idadroid/agent-sessions.json` 的原子更新。PI session 文件在 `.idadroid/pi-sessions/`，启动时传入 `--session-dir` 和具体 `--session`。旧版本历史由 `PiSessionMigration` 转换为 PI v3 tree；转换失败时原文件必须保持不变。
 
 ### 调试
 
-#### 日志
-
 ```kotlin
-android.util.Log.d("ChatHttpClient", "SSE line: $line")
-android.util.Log.e("PiAgentManager", "Error", e)
-```
-
-#### 状态检查
-
-```kotlin
-// 查看 UI 状态
+// Compose 通过 collectAsStateWithLifecycle 观察
 piAgentManager.state.value
-
-// 查看消息历史
 piAgentManager.state.value.messages
-
-// 查看 token 使用量
-piAgentManager.conversationManager.getTokenUsage()
+piAgentManager.state.value.activeStats
 ```
+
+不要打印完整 RPC、stderr、配置文件或环境变量；它们可能包含 prompt、文件内容和凭据。UI 只显示 `PiConfigManager.redact()` 之后的错误和 stderr 摘要。
+
+### Runtime / DNS
+
+`IdaProotRuntime` 启动前会调用 `RootfsConfigurator.ensureResolverConfig()`。不要恢复 rootfs 内的绝对 `resolv.conf` symlink；配置器会先用 `lstat` 删除链接，再写入固定的 nameserver 与 `use-vc` 选项。arm64 设备优先使用完整性校验通过且 probe 成功的 proroot，其他情况使用带 `--kill-on-exit` 的 proot。
 
 ## UI 开发指南
 
@@ -141,17 +95,19 @@ piAgentManager.conversationManager.getTokenUsage()
 
 | 页面 | 文件 | 说明 |
 |------|------|------|
-| Home | `HomeScreen.kt` | 主界面，包含 IDA/VNC/Terminal/Agent 标签 |
-| Agent Chat | `BoxedAgentLikeScreen.kt` | AI 对话界面 |
-| AI Config | `AiConfigEditor.kt` | AI Provider/Model 配置 |
+| Home | `HomeScreen.kt` / `IdaDroidApp.kt` | 环境、IDA/VNC、Terminal、Agent 入口 |
+| Agent Chat | `AgentScreen.kt` | 响应式聊天、Session、工具、工作区和配置面板 |
+| Agent components | `AgentComposer.kt` / `AgentToolTimeline.kt` / `AgentMarkdown.kt` | 输入、队列、附件、工具和 Markdown 渲染 |
+| AI Config | `AiConfigEditor.kt` / `AgentModelControls.kt` | Provider、Model、凭据和 PI 配置 |
 | Settings | `SettingsScreen.kt` | 应用设置 |
-| About | `AboutScreen.kt` | 关于页面 |
+| About | `AboutScreen.kt` | 版本与许可 |
 
 ### 添加新的 UI 状态字段
 
-1. 在 `AgentModels.kt` 的 `AgentUiState` 中添加字段
-2. 在 `PiAgentManager` 中更新状态时包含该字段
-3. 在 UI 中通过 `state.value.fieldName` 访问
+1. 在 `AgentModels.kt` 的 `AgentUiState` 中添加字段。
+2. 在 `PiAgentManager` 的事件/命令路径中更新字段，并保证 generation 失效时不写回旧会话。
+3. 在 `AgentScreen` 或拆出的 Composable 中通过 `collectAsStateWithLifecycle` 读取。
+4. 如果字段代表处理中状态，同时更新停止、超时、EOF、失败和 settle 路径，避免一直 loading。
 
 ## 测试
 
@@ -162,7 +118,9 @@ piAgentManager.conversationManager.getTokenUsage()
 ```
 
 现有测试：
-- `PiMessageNormalizerTest`: 消息标准化测试
+- `PiMessageNormalizerTest`: PI 消息格式标准化
+- `PiRpcTransportTest`: 乱序响应、坏 JSON、超时、EOF 和进程清理
+- `PiSessionMigrationTest`: 原生历史迁移、工具/图片内容与失败回滚
 
 ### 添加测试
 
@@ -181,23 +139,15 @@ class MyTest {
 
 ### Q: 如何添加新的 API Key 环境变量？
 
-在 `PiConfigManager.kt` 的 `resolveConvConfig()` 中的 `envKeyForProvider` 映射中添加。
+在 Agent 配置页的 `env` 中添加合法的 shell 变量名，并在 `models.json` 的 Provider 中引用 `envKey`。不要在 Kotlin 源码或日志中硬编码密钥。
 
-### Q: 如何修改流式输出的刷新频率？
+### Q: 如何修改 PI 命令超时？
 
-修改 `PiAgentManager.kt` 中的 `STREAM_FLUSH_INTERVAL_MS` 常量（默认 33ms）。
+在具体 `PiRpcTransport.request(..., timeoutMs = ...)` 调用处设置与命令语义匹配的 deadline。正常的工具执行不能依赖一个任意的整轮超时；连接、状态探测和 compact 使用不同上限。
 
-### Q: 如何修改工具调用超时？
+### Q: 如何修改流式等待提示？
 
-修改 `ConversationManager.ConvConfig.toolTimeoutMs`（默认 120s）。
-
-### Q: 如何修改最大工具调用轮次？
-
-修改 `ConversationManager.ConvConfig.maxToolRounds`（默认 50）。
-
-### Q: 如何修改 prompt 超时？
-
-修改 `PiAgentManager.kt` 中的 `PROMPT_TIMEOUT_MS` 常量（默认 180s）。
+更新 `AgentUiState.processingPhase` 的事件映射和 `AgentProcessingStatus`；同时覆盖 `agent_start`、首个 delta、工具事件、settled、abort、EOF 和 timeout。
 
 ## 代码规范
 

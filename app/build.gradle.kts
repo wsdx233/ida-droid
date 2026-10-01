@@ -95,6 +95,12 @@ android {
     }
 
     packaging {
+        jniLibs {
+            // Android must extract the launcher into executable nativeLibraryDir.
+            useLegacyPackaging = true
+            // Upstream permits redistribution only of unmodified binaries.
+            keepDebugSymbols += "**/libproroot*.so"
+        }
         resources {
             excludes += setOf(
                 "META-INF/AL2.0",
@@ -110,6 +116,7 @@ android {
 dependencies {
     implementation("androidx.core:core-ktx:1.17.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.10.0")
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.10.0")
     implementation("androidx.activity:activity-compose:1.12.4")
 
     implementation(platform("androidx.compose:compose-bom:2026.04.01"))
@@ -118,6 +125,8 @@ dependencies {
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended:1.7.8")
+    implementation("com.mikepenz:multiplatform-markdown-renderer:0.39.2")
+    implementation("com.mikepenz:multiplatform-markdown-renderer-m3:0.39.2")
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
 

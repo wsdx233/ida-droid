@@ -1,5 +1,7 @@
 # 07 - UI / UX 方案
 
+> 实现状态：Agent/Home/Settings/Terminal 入口、会话侧滑面板、消息时间线、工具卡片、Markdown、附件与配置编辑已落地在 `ui/`；运行时状态由 `PiAgentManager` 和环境验证状态驱动。VNC 仍保持独立能力入口，未把 WebView 引入聊天页。
+
 ## 设计原则
 
 - **Chat-first，但不是 Chat-only**：用户多数时间在 agent 页面，但 VNC/终端是高频辅助入口。
@@ -334,10 +336,10 @@ rootfs 已可用于终端和 agent，但缺少 VNC/X 组件，暂时无法启动
 ## MVP UI 清单
 
 - [ ] Welcome/import/validation。
-- [ ] Home dashboard。
-- [ ] Terminal Activity。
+- [x] Home dashboard。
+- [x] Terminal Activity。
 - [ ] VNC Viewer Activity 或 external fallback。
-- [ ] Chat page with session list overlay。
-- [ ] Message list + composer + attachments。
-- [ ] Diagnostics logs。
-- [ ] Settings minimal。
+- [x] Chat page with session list overlay。
+- [x] Message list + composer + attachments。
+- [x] Diagnostics logs。
+- [x] Settings minimal。

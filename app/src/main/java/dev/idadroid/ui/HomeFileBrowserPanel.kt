@@ -607,10 +607,4 @@ private fun loadAppIconBitmap(pm: PackageManager, appInfo: ApplicationInfo, size
     appInfo.loadIcon(pm).toBitmap(width = sizePx, height = sizePx, config = Bitmap.Config.ARGB_8888)
 }.getOrNull()
 
-private fun formatBytes(value: Long): String = when {
-    value >= 1024L * 1024L * 1024L -> "%.1f GiB".format(value / 1024.0 / 1024.0 / 1024.0)
-    value >= 1024L * 1024L -> "%.1f MiB".format(value / 1024.0 / 1024.0)
-    value >= 1024L -> "${value / 1024} KiB"
-    else -> "$value B"
-}
 

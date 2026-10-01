@@ -17,6 +17,7 @@ data class AgentSessionRecord(
     val thinkingLevel: String? = null,
     val autoCompactionEnabled: Boolean? = null,
     val sessionFile: String? = null,
+    val hasPersistedHistory: Boolean? = null,
     val error: String? = null
 )
 
@@ -163,7 +164,8 @@ data class AgentUiState(
 ) {
     val activeSession: AgentSessionRecord? get() = sessions.firstOrNull { it.id == activeSessionId }
     val activeSessionHasConfiguredModel: Boolean get() = activeSession?.let { !it.provider.isNullOrBlank() && !it.model.isNullOrBlank() } == true
-    val agentConfigReady: Boolean get() = piConfig.modelCatalog.isUsable
+    val agentConfigReady: Boolean get() = piConfig.modelCatalog.parseError == null &&
+        (piConfig.modelCatalog.isUsable || (piConfig.defaultProvider.isNotBlank() && piConfig.defaultModel.isNotBlank()) || activeSessionHasConfiguredModel || sessionModels.isNotEmpty())
     val canUseActiveSession: Boolean get() = agentConfigReady && activeSessionHasConfiguredModel
     val isWorking: Boolean get() = turnActive || status == "working"
     val canSend: Boolean get() = activeSessionId != null && canUseActiveSession && !isWorking && status != "starting"
@@ -217,17 +219,3 @@ data class ChatMessage(
     val toolStatus: String? = null
 )
 
-/** DTO → UI 模型转换 */
-fun ChatHttpClient.ChatMessageDto.toUiMessage(): ChatMessage = ChatMessage(
-    id = java.util.UUID.randomUUID().toString(),
-    role = role,
-    text = content ?: "",
-    timestamp = System.currentTimeMillis(),
-    toolCallId = toolCallId,
-    toolName = name,
-    toolResult = content,
-    toolStatus = if (role == "tool") "done" else null
-)
-
-/** 批量 DTO → UI 转换 */
-fun List<ChatHttpClient.ChatMessageDto>.toUiMessages(): List<ChatMessage> = mapNotNull { it.toUiMessage() }

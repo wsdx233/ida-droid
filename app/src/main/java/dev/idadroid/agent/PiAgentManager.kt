@@ -5,432 +5,259 @@ import android.net.Uri
 import dev.idadroid.env.EnvironmentPaths
 import java.io.File
 import java.time.Instant
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.launch
-import dev.idadroid.util.runCatchingSuspend
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
-import kotlin.coroutines.coroutineContext
-import kotlinx.serialization.decodeFromString
+import dev.idadroid.util.runCatchingSuspend
+import dev.idadroid.proot.IdaProotRuntime
 import kotlinx.serialization.encodeToString
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonElement
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.*
 
 class PiAgentManager(
     context: Context,
     private val paths: EnvironmentPaths = EnvironmentPaths.of(context)
-) {
+) : java.io.Closeable {
     private val appContext = context.applicationContext
     private val settings = dev.idadroid.settings.IdaDroidSettings(appContext)
-    /** 用户设置的工作区路径 (proot 内可见路径)，默认 /root/pi_workspace */
-    private val workspaceProotPath: String get() = settings.envSettings.value.workspacePath.ifBlank { dev.idadroid.settings.IdaDroidSettings.DEFAULT_WORKSPACE_PATH }
-    /** 工作区在主机文件系统上的根目录 */
-    private val workspaceHostRoot: File get() {
-        val ws = workspaceProotPath
-        // /root/xxx → 在 rootfs 内
-        if (ws.startsWith("/root/")) return File(paths.rootfsDir, ws.removePrefix("/"))
-        // /sdcard/xxx 或 /storage/xxx → proot 已绑定，直接用主机路径
-        if (ws.startsWith("/sdcard") || ws.startsWith("/storage")) return File(ws)
-        // 其他情况默认在 rootfs 内
-        return File(paths.rootfsDir, ws.removePrefix("/").ifBlank { "root/pi_workspace" })
-    }
+    private val workspaceProotPath get() = settings.envSettings.value.workspacePath.ifBlank { dev.idadroid.settings.IdaDroidSettings.DEFAULT_WORKSPACE_PATH }
+    private val workspaceHostRoot get() = guestFile(workspaceProotPath)
     private val repo = AgentSessionRepository(appContext, paths)
     private val configManager = PiConfigManager(appContext, paths)
     val aiConfigTools = AiConfigTools(paths, configManager)
     private val attachmentManager = AttachmentManager(appContext, paths)
     val workspaceManager = WorkspaceManager(appContext, paths)
     private val deepIndexToolChain = dev.idadroid.deepindex.DeepIndexToolChain(appContext, paths)
+    private val runtime = IdaProotRuntime(appContext, paths)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private val json = Json { ignoreUnknownKeys = true; explicitNulls = false; isLenient = true }
-    // Send lock: prevents concurrent sendPrompt calls from racing. Operit uses
-    // a similar coordination pattern in MessageCoordinationDelegate.
-    private val sendMutex = kotlinx.coroutines.sync.Mutex()
-    @Volatile private var sendingInProgress = false
-    /** 当主动 abort 上一轮对话时设为 true，收到 abort 错误事件后静默处理 */
-    @Volatile private var suppressAbortError = false
-
-    // ==================== 新架构：分层对话引擎 ====================
-    // Layer 1 (ChatHttpClient) + Layer 2 (ToolExecutor) + Layer 2.5 (ContextWindow)
-    // + Layer 3 (ConversationEngine) — 替代旧 ConversationEngine
-    private val conversationEngine = ConversationEngine(
-        appContext, paths, dev.idadroid.proot.IdaProotRuntime(appContext, paths)
-    ).apply {
-        compactor = { messages -> generateLlmSummary(messages.map { it.toUiMessage() }, null) }
-    }
-    @Volatile private var currentSendJob: Job? = null
-    /** ConversationEngine 当前上下文归属的会话 id（引擎全局共享，切换会话时必须 reset/恢复）。 */
-    @Volatile private var engineSessionId: String? = null
-
-    private val _state = MutableStateFlow(AgentUiState(activity = "agent 未启动"))
+    private val operations = Mutex()
+    private val json = Json { ignoreUnknownKeys = true }
+    private val _state = MutableStateFlow(AgentUiState(activity = "PI 未启动"))
     val state: StateFlow<AgentUiState> = _state.asStateFlow()
+    private var transport: PiRpcTransport? = null
+    private var boundSession: String? = null
+    private var generation = 0L
+    private var messageRevision = 0L
+    private var turnSerial = 0L
+    private data class QueuedPrompt(val wireText: String, val displayText: String, val mode: String)
+    private val queuedPrompts = mutableListOf<QueuedPrompt>()
+    private var submitting = false
+    private var retrying = false
+    private var compacting = false
+    private var monitor: Job? = null
+    private var streamingId: String? = null
+    private var streamingBase = emptyList<ChatMessage>()
+    private var closed = false
 
-    // ==================== 流式 delta 合并器 ====================
-    // 提取为 DeltaFlusher 独立类 — 高频 delta 节拍 flush，避免主线程卡帧
-    private val deltaFlusher = DeltaFlusher(_state, scope) { newMessageId() }
+    private fun publishQueue() {
+        _state.update { it.copy(activeQueue = QueueState(
+            queuedPrompts.filter { item -> item.mode == "steer" }.map { item -> item.displayText },
+            queuedPrompts.filter { item -> item.mode == "followUp" }.map { item -> item.displayText })) }
+    }
 
-    fun refresh(createDefaultIfReady: Boolean = false) {
-        if (!paths.rootfsDir.isDirectory) {
-            _state.update { AgentUiState(activity = "rootfs 未导入") }
-            return
-        }
-        // 文件 IO 切到 IO 线程；任何一步失败只更新错误状态，绝不能让
-        // 启动链路（IdaDroidApp LaunchedEffect → refresh）的未捕获异常杀死进程。
+    /** Application-owned: never close on screen/activity recreation. */
+    override fun close() { closed = true; disconnect(); scope.cancel() }
+
+    private fun disconnect() {
+        generation++
+        scope.coroutineContext.cancelChildren()
+        monitor?.cancel(); monitor = null
+        transport?.close(); transport = null; boundSession = null
+        submitting = false; retrying = false; compacting = false
+        queuedPrompts.clear()
+        streamingId = null; streamingBase = emptyList()
+        _state.update { it.copy(turnActive = false, processingPhase = null, messagesLoading = false, modelLoading = false, activeQueue = QueueState()) }
+    }
+
+    private fun operation(block: suspend () -> Unit) {
+        val epoch = generation
         scope.launch {
-            dev.idadroid.util.runCatchingSuspending {
-                val loaded = withContext(Dispatchers.IO) {
-                    val store = repo.loadStore()
-                    val snapshot = configManager.readSnapshot()
-                    val defaultPair = if (createDefaultIfReady && store.sessions.isEmpty()) resolveDefaultModel(snapshot) else null
-                    Triple(store, snapshot, defaultPair)
+            operations.withLock {
+                if (closed || epoch != generation) return@withLock
+                try { block() }
+                catch (e: CancellationException) {
+                    if (epoch == generation && e is TimeoutCancellationException) fail("PI command timed out")
+                    else throw e
                 }
-                val (store, snapshot, defaultPair) = loaded
-                val defaultProvider = defaultPair?.provider ?: snapshot.defaultProvider.trim().takeIf { it.isNotBlank() }
-                val defaultModel = defaultPair?.id ?: snapshot.defaultModel.trim().takeIf { it.isNotBlank() }
-                val defaultThinking = snapshot.defaultThinkingLevel.trim().takeIf { it.isNotBlank() }
-                val active = when {
-                    store.activeSessionId != null && store.sessions.any { it.id == store.activeSessionId } -> store.activeSessionId
-                    store.sessions.isNotEmpty() -> store.sessions.first().id
-                    createDefaultIfReady -> repo.ensureDefaultSession(
-                        provider = defaultProvider,
-                        model = defaultModel,
-                        thinkingLevel = defaultThinking
-                    ).id
-                    else -> null
-                }
-                val sessions = store.sessions
-                _state.update { old ->
-                    val activeSession = sessions.firstOrNull { it.id == active }
-                    old.copy(
-                        sessions = sessions,
-                        activeSessionId = active,
-                        status = activeSession?.status ?: "idle",
-                        error = activeSession?.error,
-                        modelLabel = modelLabel(activeSession),
-                        piConfig = snapshot,
-                        activity = if (active == null) "点击新建 Session 开始" else old.activity,
-                        workspace = old.workspace.copy(
-                            hasWorkspace = workspaceManager.hasWorkspace,
-                            workspaceName = workspaceManager.currentWorkspaceName,
-                            workspaceUri = workspaceManager.currentWorkspaceUri?.toString().orEmpty()
-                        )
-                    )
-                }
-                active?.let { loadMessages(it) }
-            }.onFailure { error ->
-                _state.update { it.copy(error = "刷新 Agent 状态失败：${error.message}", activity = "刷新失败") }
+                catch (e: Exception) { if (epoch == generation) fail(e.message ?: "PI operation failed") }
             }
         }
     }
 
+    private fun fail(message: String) { val safe = configManager.redact(message); disconnect(); setError(safe) }
+
+    fun refresh(createDefaultIfReady: Boolean = false) = operation {
+        if (!paths.rootfsDir.isDirectory) {
+            _state.update { it.copy(activity = "rootfs 未导入", status = "idle") }; return@operation
+        }
+        val snapshot = withContext(Dispatchers.IO) { configManager.readSnapshot() }
+        val store = withContext(Dispatchers.IO) {
+            if (createDefaultIfReady && repo.listSessions().isEmpty()) createDefaultSessionWithConfiguredModel()
+            repo.loadStore()
+        }
+        val active = _state.value.activeSessionId?.takeIf { id -> store.sessions.any { it.id == id } }
+            ?: store.activeSessionId ?: store.sessions.firstOrNull()?.id
+        _state.update { old -> old.copy(sessions = store.sessions, activeSessionId = active, piConfig = snapshot,
+            modelLabel = modelLabel(store.sessions.firstOrNull { it.id == active }),
+            workspace = old.workspace.copy(hasWorkspace = workspaceManager.hasWorkspace,
+                workspaceName = workspaceManager.currentWorkspaceName, workspaceUri = workspaceManager.currentWorkspaceUri?.toString().orEmpty())) }
+        if (active != null && !_state.value.turnActive && boundSession == null) readMessages(active)
+    }
+
     fun createSession(name: String = "") {
-        scope.launch {
-            runCatching {
-                requireReady()
-                val snapshot = configManager.readSnapshot()
-                val defaultPair = resolveDefaultModel(snapshot)
-                repo.createSession(
-                    name = name.ifBlank { null },
-                    provider = configManager.defaultProvider() ?: defaultPair?.provider,
-                    model = configManager.defaultModel() ?: defaultPair?.id,
-                    thinkingLevel = configManager.defaultThinking()
-                )
-            }.onSuccess { session ->
-                // selectSession 内部会先把引擎从旧会话切走（abort + bind + loadMessages）
-                selectSession(session.id)
-            }.onFailure { error -> setError("新建 Session 失败：${error.message}") }
+        disconnect()
+        _state.update { it.copy(status = "starting", activity = "正在新建会话", messages = emptyList(), error = null) }
+        operation {
+            requireReady()
+            val session = withContext(Dispatchers.IO) {
+                val cfg = configManager.readSnapshot(); val model = resolveDefaultModel(cfg)
+                repo.createSession(name, model?.provider, model?.id, cfg.defaultThinkingLevel)
+            }
+            _state.update { it.copy(activeSessionId = session.id, activeStats = null) }
+            readMessages(session.id)
         }
     }
 
     fun selectSession(id: String) {
-        scope.launch {
-            try {
-                // 切换会话前先中止/收尾旧会话的发送，避免引擎上下文串写
-                val current = _state.value.activeSessionId
-                if (current != null && current != id && _state.value.turnActive) {
-                    runCatching { abortSession(current) }
-                }
-                // 先把引擎绑定到目标会话（必要时持久化旧会话并从文件恢复历史）。
-                // 绑定成功后才提交 active：若这里失败（读历史文件异常等），store 仍保持
-                // 旧 active，不会出现"store 已切换但引擎丢失目标历史"的错位。
-                val session = repo.listSessions().firstOrNull { it.id == id }
-                    ?: error("session 不存在：$id")
-                val convConfig = session.let { resolveConvConfig(it.id, it) }
-                bindEngineToSession(id, convConfig)
-                repo.setActive(id)
-            } catch (e: Exception) {
-                setError("切换 Session 失败：${e.message}")
-                return@launch
-            }
-            refresh()
-            loadMessages(id)
-        }
+        if (id == _state.value.activeSessionId && transport != null) return
+        disconnect()
+        _state.update { it.copy(activeSessionId = id, messages = emptyList(), activeStats = null, status = "starting", activity = "正在加载会话", error = null) }
+        operation { withContext(Dispatchers.IO) { repo.setActive(id) }; readMessages(id) }
     }
 
     fun renameSession(id: String, name: String) {
         if (name.isBlank()) return
-        scope.launch {
-            runCatching { repo.patchSession(id) { it.copy(name = name.trim()) } }
-                .onSuccess { refresh() }
-                .onFailure { error -> setError("重命名失败：${error.message}") }
+        if (id != _state.value.activeSessionId) selectSession(id)
+        operation {
+            connection(id).request("set_session_name", fields("name" to name.trim()))
+            withContext(Dispatchers.IO) { repo.patchSession(id) { it.copy(name = name.trim()) } }
+            publishSessions()
         }
     }
 
     fun deleteSession(id: String) {
-        scope.launch {
-            runCatching {
-                conversationEngine.abort()
-                repo.deleteSession(id)
-            }.onSuccess {
-                // 删除的是引擎当前绑定的会话 → 清空引擎，等待下一个会话重新 bind
-                if (engineSessionId == id) {
-                    dev.idadroid.util.runCatchingSuspending { conversationEngine.reset() }
-                    engineSessionId = null
+        if (id == _state.value.activeSessionId) disconnect()
+        operation {
+            withContext(Dispatchers.IO) {
+                val session = repo.listSessions().firstOrNull { it.id == id } ?: return@withContext
+                session.sessionFile?.let { path ->
+                    val source = guestFile(path)
+                    if (source.isFile) {
+                        val trash = File(workspaceHostRoot, ".idadroid/deleted-sessions").apply { mkdirs() }
+                        check(source.renameTo(File(trash, "${newMessageId()}-${source.name}"))) { "Cannot archive session; nothing deleted" }
+                    }
                 }
-                refresh(createDefaultIfReady = true)
-            }.onFailure { error -> setError("删除 Session 失败：${error.message}") }
+                repo.deleteSession(id)
+            }
+            val store = withContext(Dispatchers.IO) { repo.loadStore() }
+            _state.update { old -> if (old.activeSessionId == id) old.copy(activeSessionId = store.activeSessionId, messages = emptyList(), sessions = store.sessions, status = "idle", activeStats = null)
+                else old.copy(sessions = store.sessions) }
+            if (boundSession == null) store.activeSessionId?.let { readMessages(it) }
         }
     }
 
     fun startSession(id: String? = null) {
-        scope.launch {
-            val sessionId = id ?: _state.value.activeSessionId ?: createDefaultSessionWithConfiguredModel().id
-            // 新架构：不需要启动 pi 进程，只需更新状态
-            repo.updateRuntimeStatus(sessionId, "running", null)
-            _state.update { it.copy(status = "running", error = null, activeSessionId = sessionId, sessions = repo.listSessions(), activity = "就绪") }
+        val target = id ?: _state.value.activeSessionId
+        if (target != null && target != _state.value.activeSessionId) { selectSession(target); return }
+        if (_state.value.status == "starting" || transport != null) return
+        _state.update { it.copy(status = "starting", activity = "正在启动 PI", error = null) }
+        operation {
+            val session = target ?: withContext(Dispatchers.IO) { createDefaultSessionWithConfiguredModel().id }
+            _state.update { it.copy(activeSessionId = session) }; readMessages(session)
         }
     }
 
     fun stopSession(id: String? = null) {
-        scope.launch {
-            val sessionId = id ?: _state.value.activeSessionId ?: return@launch
-            // 新架构：abort 当前对话 + 更新状态
-            conversationEngine.abort()
-            repo.updateRuntimeStatus(sessionId, "idle", null)
-            _state.update { it.copy(status = "idle", turnActive = false, processingPhase = null, activity = "已停止") }
-            refresh()
-        }
+        val target = id ?: _state.value.activeSessionId ?: return
+        if (target != _state.value.activeSessionId) return
+        disconnect()
+        _state.update { it.copy(status = "stopped", activity = "PI 已停止", error = null) }
+        operation { withContext(Dispatchers.IO) { repo.updateRuntimeStatus(target, "stopped") }; publishSessions() }
     }
 
-    fun sendPrompt(text: String, attachments: List<DraftAttachment> = emptyList(), sendMode: String? = null) {
-        scope.launch {
-            // 用 sendMutex 串行化发送，消除 sendingInProgress 检查和实际发送之间的竞态
-            sendMutex.withLock {
-                if (sendingInProgress) {
-                    _state.update { it.copy(activity = "上一条消息仍在发送中，请稍候…") }
-                    return@withLock
-                }
-                sendingInProgress = true
-                try {
-                    sendPromptInternal(text, attachments, sendMode)
-                } finally {
-                    sendingInProgress = false
-                }
-            }
-        }
-    }
-
-    private suspend fun sendPromptInternal(text: String, attachments: List<DraftAttachment>, sendMode: String?) {
-        val sessionId = _state.value.activeSessionId ?: run {
-            val created = createDefaultSessionWithConfiguredModel()
-            refresh()
-            created.id
-        }
-        val trimmed = text.trimEnd()
-        if (trimmed.isBlank() && attachments.isEmpty()) return
-        // sendMutex 已在 sendPrompt 中获取，这里直接执行
-        try {
-                val session = repo.setActive(sessionId)
+    /** Synchronous admission: false means the composer must retain its draft. */
+    fun sendPrompt(text: String, attachments: List<DraftAttachment> = emptyList(), sendMode: String? = null): Boolean {
+        val queueMode = when (sendMode) { "steer" -> "steer"; "followUp", "follow_up" -> "followUp"; else -> null }
+        if (closed || submitting || (text.isBlank() && attachments.isEmpty()) || !paths.readyMarker.isFile) return false
+        if (_state.value.status == "starting" || (_state.value.turnActive && queueMode == null)) return false
+        val queued = _state.value.turnActive
+        if (!queued) turnSerial++
+        submitting = true
+        val epoch = generation
+        _state.update { it.copy(turnActive = true, status = "working", error = null, activity = if (queued) "正在排队" else "正在发送…",
+            processingPhase = if (queued) it.processingPhase else "connecting", promptSentAt = if (queued) it.promptSentAt else System.currentTimeMillis(), firstDeltaAt = if (queued) it.firstDeltaAt else 0L) }
+        operation {
+            var queuedPrompt: QueuedPrompt? = null
+            try {
+                val id = _state.value.activeSessionId ?: withContext(Dispatchers.IO) { createDefaultSessionWithConfiguredModel().id }
+                _state.update { it.copy(activeSessionId = id) }
+                val rpc = connection(id)
                 val stored = attachmentManager.storeAttachments(attachments)
-                val uploadedPaths = stored.map { it.prootPath }
-                val displayAttachments = stored.map { it.display }
-                val displayMessage = buildString {
-                    append(trimmed)
-                    if (uploadedPaths.isNotEmpty()) {
-                        if (isNotEmpty() && !last().isWhitespace()) append(' ')
-                        append(uploadedPaths.joinToString(" ") { attachmentManager.fileRef(it) })
-                    }
-                }.ifBlank { attachmentSummary(displayAttachments) }
-
-                appendMessage(ChatMessage(newMessageId(), "user", displayMessage, System.currentTimeMillis(), attachments = displayAttachments))
-                setTurnActive(sessionId, true)
-                val promptStartTime = System.currentTimeMillis()
-                _state.update { it.copy(activity = "正在发送消息…", processingPhase = "connecting", promptSentAt = promptStartTime, firstDeltaAt = 0L) }
-
-                // ==================== 新架构路径 ====================
-                // 解析 API Key / Base URL / Model 从 PiConfigManager
-                val convConfig = resolveConvConfig(sessionId, session)
-                    ?: run {
-                        setTurnActive(sessionId, false)
-                        appendMessage(ChatMessage(newMessageId(), "system", "配置缺失：请先在设置中配置 API Key 和 Base URL", System.currentTimeMillis()))
-                        setError("配置缺失：请先在设置中配置 API Key 和 Base URL")
-                        return
-                    }
-
-                val expanded = attachmentManager.expandFileReferencesForPrompt(displayMessage, session.cwd)
-                currentSendJob = coroutineContext[Job]
-
-                try {
-                    kotlinx.coroutines.withTimeout(PROMPT_TIMEOUT_MS) {
-                        // 发送前把引擎绑定到当前会话：应用重启/切换会话后引擎可能为空或
-                        // 属于其它会话，需要先从该会话文件恢复历史，否则对话会丢失上下文
-                        bindEngineToSession(sessionId, convConfig)
-                        val imageUris = expanded.images.map { img ->
-                            "data:${img.mimeType};base64,${img.data}"
-                        }
-                        conversationEngine.send(expanded.message, imageUris, convConfig) { event ->
-                            handleEngineEvent(sessionId, event, promptStartTime)
-                        }
-                    }
-                } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
-                    appendMessage(ChatMessage(newMessageId(), "system", "发送超时（3分钟无完成）", System.currentTimeMillis()))
-                } catch (e: kotlinx.coroutines.CancellationException) {
-                    android.util.Log.i("PiAgentManager", "Prompt cancelled by abort (sessionId=$sessionId)")
-                    throw e
-                } catch (e: Exception) {
-                    val msg = e.message ?: e::class.simpleName ?: "未知异常"
-                    appendMessage(ChatMessage(newMessageId(), "system", "发送失败：$msg", System.currentTimeMillis()))
-                    setError("发送失败：$msg")
-                } finally {
-                    currentSendJob = null
-                    finishStreamingFlush()
-                    if (_state.value.turnActive) setTurnActive(sessionId, false)
-                    // 持久化对话历史 — 防止崩溃/重启后丢失
-                    persistMessages(sessionId)
+                val prompt = buildString {
+                    append(text.trimEnd())
+                    stored.forEach { append(' '); append(attachmentManager.fileRef(it.prootPath)) }
+                    if (deepIndexToolChain.isEnabled()) append("\nUse the installed deep-index toolchain (CodeGraph + ECC + Memory) for this task.")
                 }
-            } catch (e: Exception) {
-                if (e is kotlinx.coroutines.CancellationException) throw e
-                setTurnActive(sessionId, false)
-                val msg = e.message ?: e::class.simpleName ?: "未知异常"
-                appendMessage(ChatMessage(newMessageId(), "system", "发送失败：$msg", System.currentTimeMillis()))
-                setError("发送失败：$msg")
-            }
+                val expanded = attachmentManager.expandFileReferencesForPrompt(prompt)
+                val images = expanded.images.toMutableList()
+                stored.filter { it.isImage }.forEach { item ->
+                    val image = item.display as ChatAttachment.Image
+                    if (images.none { it.data == image.data }) images += ImagePayload(data = image.data, mimeType = image.mimeType)
+                }
+                if (queued && queueMode != null) {
+                    queuedPrompt = QueuedPrompt(expanded.message, text.ifBlank { attachmentSummary(stored.map { it.display }) }, queueMode)
+                    queuedPrompts += queuedPrompt
+                    publishQueue()
+                }
+                rpc.request("prompt", buildJsonObject {
+                    put("message", expanded.message)
+                    if (images.isNotEmpty()) put("images", json.encodeToJsonElement(images))
+                    if (queued && queueMode != null) put("streamingBehavior", queueMode)
+                })
+                if (epoch == generation) { _state.update { it.copy(activity = if (it.turnActive) "PI 已接受消息" else it.activity) }; startMonitor(epoch, id) }
+            } catch (error: PiRpcCommandException) {
+                queuedPrompt?.let { queuedPrompts.remove(it); publishQueue() }
+                if (!queued) throw error
+                _state.update { it.copy(error = configManager.redact(error.message ?: "PI rejected queued message")) }
+            } finally { if (epoch == generation) submitting = false }
+        }
+        return true
     }
 
     fun abort(id: String? = null) {
+        val target = id ?: _state.value.activeSessionId ?: return
+        if (target != _state.value.activeSessionId) return
+        if (submitting || transport == null) { stopSession(target); return }
+        val epoch = generation
+        val rpc = transport ?: return
         scope.launch {
-            val sessionId = id ?: _state.value.activeSessionId ?: return@launch
-            abortSession(sessionId)
-        }
-    }
-
-    /** abort 的实际逻辑（可在切换会话前同步调用）。 */
-    private suspend fun abortSession(sessionId: String) {
-        // 标记：后续收到的 abort 相关错误事件静默处理
-        suppressAbortError = true
-        // 新架构：cancel sendJob 让 ConversationEngine.send() 的流收集中断
-        currentSendJob?.let { job ->
-            job.cancel()
-            try { job.join() } catch (_: kotlinx.coroutines.CancellationException) {}
-        }
-        currentSendJob = null
-        conversationEngine.abort()
-        finishStreamingFlush()
-        setTurnActive(sessionId, false)
-        repo.updateRuntimeStatus(sessionId, "running", null)
-    }
-
-    fun loadMessages(id: String? = null) {
-        scope.launch {
-            val sessionId = id ?: _state.value.activeSessionId ?: return@launch
-            _state.update { it.copy(messagesLoading = true) }
-            try {
-                val session = repo.listSessions().firstOrNull { it.id == sessionId }
-                val convConfig = session?.let { resolveConvConfig(it.id, it) }
-                // 引擎绑定失败（历史文件读取异常）不阻塞展示：loadMessagesInternal 会回退读文件
-                runCatching { bindEngineToSession(sessionId, convConfig) }
-                val messages = withContext(Dispatchers.IO) { loadMessagesInternal(sessionId) }
-                _state.update { it.copy(messages = messages, messagesLoading = false) }
-            } catch (e: Exception) {
-                setError("加载消息失败：${e.message}")
-                _state.update { it.copy(messagesLoading = false) }
+            try { rpc.request("abort", timeoutMs = 5_000) }
+            catch (_: Exception) { /* Hard stop below also handles hung tools/preflight. */ }
+            if (epoch == generation) {
+                disconnect()
+                _state.update { it.copy(status = "stopped", activity = "已取消", error = null) }
+                operation { withContext(Dispatchers.IO) { repo.updateRuntimeStatus(target, "stopped") }; publishSessions() }
             }
         }
     }
 
-    /**
-     * 把 ConversationEngine 的全局上下文绑定到指定会话：
-     * 切换会话时先把旧上下文持久化到旧会话文件，重置引擎，再从目标会话
-     * 文件恢复历史消息。这样每个会话的消息互相隔离，不再"新建会话却显示
-     * 上一个会话的内容"。调用方需保证当前没有正在运行的 send（切换前 abort）。
-     *
-     * 注意：目标历史文件的读取放在任何引擎状态变更之前 —— 若读取失败会抛异常，
-     * 引擎与 engineSessionId 均保持不变，调用方（如 selectSession）可以放弃切换，
-     * 不会出现"store 已切到目标会话但引擎丢失目标历史"的错位。
-     */
-    private suspend fun bindEngineToSession(sessionId: String, config: ConversationConfig?) {
-        val bound = engineSessionId
-        if (bound == sessionId) return
-        // 先读目标会话的历史（可能抛 IOException），确认能恢复再动引擎
-        var dtos = emptyList<ChatHttpClient.ChatMessageDto>()
-        if (config != null) {
-            val session = repo.listSessions().firstOrNull { it.id == sessionId }
-            val sessionFile = session?.sessionFile ?: defaultSessionFilePath(sessionId)
-            val file = sessionFileToHostFile(sessionFile)?.takeIf { it.isFile }
-            if (file != null) {
-                dtos = withContext(Dispatchers.IO) {
-                    file.readLines().mapNotNull { line ->
-                        val trimmed = line.trim()
-                        if (trimmed.isBlank()) null
-                        else runCatching { json.decodeFromString<ChatHttpClient.ChatMessageDto>(trimmed) }.getOrNull()
-                    }
-                }
-            }
-        }
-        // 引擎里残留其它会话的上下文 → 先写回它的会话文件，避免丢失
-        if (bound != null && conversationEngine.getMessages().isNotEmpty()) {
-            persistMessages(bound)
-        }
-        conversationEngine.reset()
-        // 仅当配置可用（能恢复历史或确认空会话）时才标记引擎已绑定该会话。
-        // config == null（例如尚未配置 API Key）时保持未绑定，让之后配置就绪的
-        // send/loadMessages 能重新进入本方法并加载文件历史 —— 否则 send 会因
-        // engineSessionId == sessionId 提前返回，引擎空转导致历史永久丢失。
-        engineSessionId = if (config != null) sessionId else null
-        if (dtos.isNotEmpty() && config != null) {
-            conversationEngine.restoreFromMessages(dtos, config)
-        }
+    fun loadMessages(id: String? = null) = operation {
+        val target = id ?: _state.value.activeSessionId ?: return@operation
+        if (target == _state.value.activeSessionId && !_state.value.turnActive) readMessages(target)
     }
 
-    /** 会话消息文件（proot 路径，缺省在 workspace 的 .idadroid/sessions 下）。 */
-    private fun defaultSessionFilePath(sessionId: String): String =
-        "$workspaceProotPath/.idadroid/sessions/${sessionId}.jsonl"
-
-    /**
-     * 持久化对话历史到 session 文件。
-     * 在 sendPrompt 结束后自动调用，防止崩溃/重启后丢失。
-     */
-    private suspend fun persistMessages(sessionId: String) {
+    private suspend fun readMessages(id: String) {
+        _state.update { it.copy(messagesLoading = true) }
         try {
-            val messages = conversationEngine.getMessages()
-            if (messages.isEmpty()) return
-            withContext(Dispatchers.IO) {
-                val session = repo.listSessions().firstOrNull { it.id == sessionId } ?: return@withContext
-                // sessionFile 为空时创建默认路径，并回写到 session 记录便于后续恢复
-                val sessionFile = session.sessionFile ?: defaultSessionFilePath(sessionId)
-                val file = sessionFileToHostFile(sessionFile) ?: return@withContext
-                file.parentFile?.mkdirs()
-                // 每条消息一行 JSON，便于增量读取和恢复
-                file.writeText(messages.joinToString("\n") { msg ->
-                    json.encodeToString(ChatHttpClient.ChatMessageDto.serializer(), msg)
-                } + "\n")
-                if (session.sessionFile.isNullOrBlank()) {
-                    repo.setSessionFile(sessionId, sessionFile)
-                }
-            }
-        } catch (e: Exception) {
-            android.util.Log.w("PiAgentManager", "消息持久化失败: ${e.message}")
-        }
+            val rpc = connection(id)
+            val revision = messageRevision
+            val data = rpc.request("get_messages")
+            if (!_state.value.turnActive && messageRevision == revision && _state.value.activeSessionId == id)
+                _state.update { it.copy(messages = normalizePiMessages((data["messages"] as? JsonArray).orEmpty())) }
+        } finally { _state.update { it.copy(messagesLoading = false) } }
     }
 
     fun clearRawLog() {
@@ -574,38 +401,22 @@ class PiAgentManager(
 
     suspend fun readDraftAttachment(uri: android.net.Uri): DraftAttachment = attachmentManager.readDraft(uri)
 
-    fun loadSessionModels(force: Boolean = false) {
-        scope.launch {
-            if (_state.value.sessionModels.isNotEmpty() && !force) return@launch
-            _state.update { it.copy(modelLoading = true) }
-            runCatching {
-                // 新架构：直接从 config 读模型列表，不需要 pi agent
-                configManager.readSnapshot().modelCatalog.models.map { it.toPiModel() }
-            }.onSuccess { models ->
-                _state.update { it.copy(sessionModels = models, modelLoading = false) }
-            }.onFailure { error ->
-                val fallback = configManager.readSnapshot().modelCatalog.models.map { it.toPiModel() }
-                _state.update { it.copy(sessionModels = fallback, modelLoading = false) }
-                if (fallback.isEmpty()) setError("加载模型失败：${error.message}")
-            }
-        }
+    fun loadSessionModels(force: Boolean = false) = operation {
+        if (!force && _state.value.sessionModels.isNotEmpty()) return@operation
+        val id = _state.value.activeSessionId ?: return@operation
+        _state.update { it.copy(modelLoading = true) }
+        try {
+            val data = connection(id).request("get_available_models")
+            _state.update { it.copy(sessionModels = (data["models"] as? JsonArray).orEmpty().map { model -> json.decodeFromJsonElement<PiModel>(model) }) }
+        } finally { _state.update { it.copy(modelLoading = false) } }
     }
 
-    fun setSessionModel(model: PiModel) {
-        val rawProvider = model.providerNameOrNull() ?: return setError("模型缺少 provider")
-        // 新架构：provider 映射保留用于 session 存储一致性
-        val provider = when (rawProvider) {
-            "custom", "openai-generic" -> "openai"
-            else -> rawProvider
-        }
-        scope.launch {
-            val sessionId = _state.value.activeSessionId ?: return@launch
-            runCatching {
-                // 新架构：不需要 runtime.setModel()，下次 sendPrompt 会用新 config
-                repo.patchSession(sessionId) { it.copy(provider = provider, model = model.id, lastActiveAt = Instant.now().toString()) }
-            }.onSuccess { refresh() }
-                .onFailure { error -> setError("切换模型失败：${error.message}") }
-        }
+    fun setSessionModel(model: PiModel) = operation {
+        check(!_state.value.turnActive) { "Stop the active turn before changing models" }
+        val id = _state.value.activeSessionId ?: return@operation
+        val rpc = connection(id)
+        rpc.request("set_model", fields("provider" to (model.providerNameOrNull() ?: error("Missing provider")), "modelId" to model.id))
+        persistRuntimeState(id, rpc.request("get_state"))
     }
 
     fun setSessionModelManual(provider: String, modelId: String) {
@@ -613,197 +424,61 @@ class PiAgentManager(
         setSessionModel(PiModel(id = modelId.trim(), provider = provider.trim()))
     }
 
-    fun chooseThinking(level: String) {
-        scope.launch {
-            val sessionId = _state.value.activeSessionId ?: return@launch
-            runCatching {
-                // 新架构：thinking level 存在 session 里，下次 sendPrompt 时传给 ConvConfig
-                repo.patchSession(sessionId) { it.copy(thinkingLevel = level, lastActiveAt = Instant.now().toString()) }
-            }.onSuccess { refresh() }
-                .onFailure { error -> setError("切换 Thinking 失败：${error.message}") }
-        }
+    fun chooseThinking(level: String) = operation {
+        val id = _state.value.activeSessionId ?: return@operation
+        val rpc = connection(id)
+        rpc.request("set_thinking_level", fields("level" to level))
+        persistRuntimeState(id, rpc.request("get_state"))
     }
 
-    fun setAutoCompaction(enabled: Boolean) {
-        scope.launch {
-            val sessionId = _state.value.activeSessionId ?: return@launch
-            runCatching {
-                // 新架构：auto compaction 由 ConversationEngine 的 maxToolRounds 控制
-                repo.patchSession(sessionId) { it.copy(autoCompactionEnabled = enabled, lastActiveAt = Instant.now().toString()) }
-            }.onSuccess { refresh() }
-                .onFailure { error -> setError("切换 Compact 失败：${error.message}") }
-        }
+    fun setAutoCompaction(enabled: Boolean) = operation {
+        val id = _state.value.activeSessionId ?: return@operation
+        val rpc = connection(id)
+        rpc.request("set_auto_compaction", buildJsonObject { put("enabled", enabled) })
+        persistRuntimeState(id, rpc.request("get_state"))
     }
 
     fun compact(customInstructions: String? = null) {
-        // 上下文压缩：保留 system 消息和最近 1/3 的对话历史，
-        // 用 LLM 生成摘要消息替代被移除的内容（替代简单截取）。
-        scope.launch {
-            sendMutex.withLock {
-                val sessionId = _state.value.activeSessionId ?: return@withLock
-                val messages = _state.value.messages
-                if (messages.size <= 6) {
-                    appendMessage(ChatMessage(newMessageId(), "system", "消息较少，无需压缩。", System.currentTimeMillis()))
-                    return@withLock
-                }
-
-                val keepCount = maxOf(4, messages.size / 3)
-                val toSummarize = messages.dropLast(keepCount)
-                val kept = messages.takeLast(keepCount)
-
-                // 用 LLM 生成摘要（异步，不阻塞 UI）
-                val summary = generateLlmSummary(toSummarize, customInstructions)
-
-                val apiMessages = conversationEngine.getMessages()
-                val keptApiMessages = apiMessages.takeLast(minOf(keepCount, apiMessages.size))
-
-                conversationEngine.reset()
-                val convConfig = sessionId.let { id ->
-                    val session = repo.listSessions().firstOrNull { it.id == id }
-                    session?.let { resolveConvConfig(id, it) }
-                }
-                if (convConfig != null && keptApiMessages.isNotEmpty()) {
-                    conversationEngine.restoreFromMessages(keptApiMessages, convConfig)
-                }
-
-                _state.update { it.copy(messages = listOf(
-                    ChatMessage(newMessageId(), "system", summary, System.currentTimeMillis())
-                ) + kept) }
-                _state.update { it.copy(sessions = repo.listSessions()) }
-            }
+        if (_state.value.turnActive || _state.value.activeSessionId == null) return
+        _state.update { it.copy(turnActive = true, processingPhase = "compacting", status = "working", activity = "正在压缩上下文", error = null) }
+        operation {
+            val id = _state.value.activeSessionId ?: return@operation
+            connection(id).request("compact", buildJsonObject { customInstructions?.let { put("customInstructions", it) } }, timeoutMs = 180_000)
+            finishTurn(id)
         }
     }
 
-    /**
-     * 用 LLM 生成上下文摘要 — 替代旧版的简单截取。
-     * 如果 LLM 调用失败，回退到简单截取摘要。
-     */
-    private suspend fun generateLlmSummary(
-        toSummarize: List<ChatMessage>,
-        customInstructions: String?
-    ): String = withContext(Dispatchers.IO) {
-        // 复用 resolveConvConfig 的完整 provider/env/baseUrl 解析逻辑
-        val sessionId = _state.value.activeSessionId
-        val session = sessionId?.let { repo.listSessions().firstOrNull { s -> s.id == it } }
-        val convConfig = session?.let { resolveConvConfig(it.id, it) }
-            ?: return@withContext buildFallbackSummary(toSummarize, customInstructions)
-        val snapshot = configManager.readSnapshot()
-        val model = (session?.model ?: snapshot.defaultModel).trim().ifBlank {
-            return@withContext buildFallbackSummary(toSummarize, customInstructions)
-        }
-        val apiKey = convConfig.apiKey
-        val baseUrl = convConfig.baseUrl
+    fun refreshStats() = operation {
+        val id = _state.value.activeSessionId ?: return@operation
+        val data = connection(id).request("get_session_stats")
+        _state.update { it.copy(activeStats = json.decodeFromJsonElement<SessionStats>(data)) }
+    }
 
-        val prompt = buildString {
-            append("请将以下对话历史压缩为简洁的摘要，保留关键技术发现、分析结论和未完成任务。\n")
-            if (!customInstructions.isNullOrBlank()) {
-                append("用户特别要求：$customInstructions\n")
-            }
-            append("\n--- 对话历史 ---\n")
-            toSummarize.filter { it.role == "user" || it.role == "assistant" }
-                .forEach { msg ->
-                    val role = if (msg.role == "user") "用户" else "助手"
-                    val preview = msg.text.take(500)
-                    append("[$role] $preview\n")
-                }
-            append("--- 摘要 ---\n")
-        }
-
+    fun clearQueue() = operation {
+        val id = _state.value.activeSessionId ?: return@operation
         try {
-            val client = ChatHttpClient(baseUrl, apiKey, model, convConfig.providerId)
-            val response = StringBuffer()
-            client.chat(
-                messages = listOf(ChatHttpClient.ChatMessageDto(role = "user", content = prompt)),
-                tools = emptyList(),
-                systemPrompt = "你是一个对话摘要助手。请简洁地总结对话中的关键信息。",
-                thinkingLevel = null,
-                temperature = 0.3,
-                maxTokens = 2000,
-                topP = null
-            ).collect { event ->
-                when (event) {
-                    is ChatHttpClient.StreamEvent.TextDelta -> response.append(event.text)
-                    else -> {}
-                }
-            }
-            val result = response.toString().trim()
-            if (result.isNotBlank()) "[上下文压缩]\n$result" else buildFallbackSummary(toSummarize, customInstructions)
-        } catch (e: Exception) {
-            buildFallbackSummary(toSummarize, customInstructions)
+            connection(id).request("clear_queue")
+            _state.update { it.copy(activeQueue = QueueState()) }
+        } catch (_: PiRpcCommandException) {
+            _state.update { it.copy(activity = "此 PI 版本不支持清空队列，请停止本轮以取消排队消息") }
         }
     }
 
-    /** 回退摘要 — LLM 不可用时使用 */
-    private fun buildFallbackSummary(
-        toSummarize: List<ChatMessage>,
-        customInstructions: String?
-    ): String = buildString {
-        append("[上下文压缩]\n")
-        append("已压缩 ${toSummarize.size} 条早期消息。\n")
-        if (!customInstructions.isNullOrBlank()) {
-            append("用户指示：$customInstructions\n")
-        }
-        append("\n压缩前的关键内容摘要：\n")
-        toSummarize.filter { it.role == "user" || it.role == "assistant" }
-            .takeLast(5)
-            .forEach { msg ->
-                val role = if (msg.role == "user") "用户" else "助手"
-                val preview = msg.text.take(200).replace("\n", " ")
-                append("- $role: $preview...\n")
-            }
-    }
-
-    /**
-     * 自动压缩消息历史 — 由 ConversationEngine.trimContextIfNeeded 触发。
-     *
-     * 流程：
-     * 1. 将 API 级 ChatMessageDto 转为 UI 级 ChatMessage
-     * 2. 调用 generateLlmSummary 生成 LLM 摘要
-     * 3. 重置 ConversationEngine 并用压缩后的历史恢复
-     * 4. 更新 UI 状态
-     *
-     * 返回 true 表示压缩成功，false 表示失败（ConversationEngine 会回退到直接截断）。
-     */
-    private suspend fun autoCompactMessages(messages: List<ChatHttpClient.ChatMessageDto>): Boolean {
-        if (messages.size <= 6) return false
-
-        val keepCount = maxOf(4, messages.size / 3)
-        val toSummarizeDto = messages.dropLast(keepCount)
-        val keptDto = messages.takeLast(keepCount)
-
-        // 转为 UI 级 ChatMessage 用于 generateLlmSummary
-        val toSummarizeUi = toSummarizeDto.toUiMessages().filter { it.role == "user" || it.role == "assistant" }
-        if (toSummarizeUi.isEmpty()) return false
-
-        // 生成摘要
-        val summary = generateLlmSummary(toSummarizeUi, null)
-
-        // 就地替换消息列表 — 不创建新 Conversation
-        // 确保 send() 的 while 循环中持有的 conv 引用仍然有效
-        val newMessages = listOf(
-            ChatHttpClient.ChatMessageDto(role = "system", content = summary)
-        ) + keptDto
-
-        conversationEngine.compactMessages(newMessages)
-
-        // 更新 UI 状态
-        val keptUi = keptDto.toUiMessages()
-
-        _state.update { it.copy(messages = listOf(
-            ChatMessage(newMessageId(), "system", summary, System.currentTimeMillis())
-        ) + keptUi) }
-
-        android.util.Log.i("PiAgentManager", "自动压缩完成: ${toSummarizeDto.size} 条消息 → 摘要")
-        return true
+    fun setQueueModes(steering: String, followUp: String) = operation {
+        val id = _state.value.activeSessionId ?: return@operation
+        val rpc = connection(id)
+        rpc.request("set_steering_mode", fields("mode" to steering))
+        rpc.request("set_follow_up_mode", fields("mode" to followUp))
     }
 
     fun getPiConfigSnapshot(): PiConfigSnapshot = configManager.readSnapshot()
 
     fun savePiConfig(snapshot: PiConfigSnapshot) {
-        scope.launch {
-            runCatchingSuspend { withContext(Dispatchers.IO) { configManager.saveSnapshot(snapshot) } }
-                .onSuccess { _state.update { it.copy(piConfig = configManager.readSnapshot(), activity = "Pi 配置已保存；重启 session 后生效") } }
-                .onFailure { error -> setError("保存 Pi 配置失败：${error.message}") }
+        if (_state.value.turnActive) { _state.update { it.copy(activity = "请先停止当前任务再保存 PI 配置") }; return }
+        disconnect()
+        operation {
+            withContext(Dispatchers.IO) { configManager.saveSnapshot(snapshot); configManager.materialize() }
+            _state.update { it.copy(piConfig = configManager.readSnapshot(), sessionModels = emptyList(), status = "idle", activity = "PI 配置已保存，下次启动生效", error = null) }
         }
     }
 
@@ -898,110 +573,193 @@ class PiAgentManager(
         )
     }
 
-    private suspend fun refreshRuntimeState(sessionId: String) {
-        // 新架构：不依赖 pi agent runtime state，只需 refresh
-        refresh()
-    }
-
-    private fun newMessageId(): String = java.util.UUID.randomUUID().toString()
-
-    private suspend fun loadMessagesInternal(sessionId: String): List<ChatMessage> {
-        // 引擎已绑定该会话且内存有消息 → 直接用引擎快照（含本轮未落盘内容）
-        if (engineSessionId == sessionId) {
-            val convMessages = conversationEngine.getMessages()
-            if (convMessages.isNotEmpty()) {
-                return convMessages.toUiMessages()
+    private suspend fun connection(id: String): PiRpcTransport {
+        transport?.takeIf { boundSession == id }?.let { return it }
+        check(transport == null) { "Cannot bind two sessions to one PI process" }
+        requireReady()
+        val epoch = generation
+        val session = withContext(Dispatchers.IO) {
+            val record = repo.setActive(id)
+            val originalPath = record.sessionFile ?: "$workspaceProotPath/.idadroid/sessions/$id.jsonl"
+            val original = guestFile(originalPath)
+            if (original.isFile) {
+                val destinationPath = "$workspaceProotPath/.idadroid/pi-sessions/${newMessageId()}.jsonl"
+                val migrated = PiSessionMigration.migrate(original, guestFile(destinationPath), record.cwd.ifBlank { workspaceProotPath }, record.provider, record.model)
+                if (migrated != original) repo.setSessionFile(id, destinationPath) else record.copy(sessionFile = originalPath)
+            } else {
+                require(record.sessionFile == null || record.hasPersistedHistory == false) { "Session history is missing; restore the original before continuing" }
+                record
             }
         }
-        // 回退：从该会话的 session 文件读取（新版为 ChatMessageDto JSONL；
-        // 兼容旧 pi-agent 格式 JSON）
-        val session = repo.listSessions().firstOrNull { it.id == sessionId } ?: return emptyList()
-        val sessionFile = session.sessionFile ?: defaultSessionFilePath(sessionId)
-        val file = sessionFileToHostFile(sessionFile)?.takeIf { it.isFile } ?: return emptyList()
-        val lines = file.readLines()
-        val dtos = lines.mapNotNull { line ->
-            val trimmed = line.trim()
-            if (trimmed.isBlank()) null
-            else runCatching { json.decodeFromString<ChatHttpClient.ChatMessageDto>(trimmed) }.getOrNull()
+        val spec = withContext(Dispatchers.IO) {
+            val dir = configManager.materialize()
+            val args = mutableListOf("pi", "--mode", "rpc", "--session-dir", "$workspaceProotPath/.idadroid/pi-sessions")
+            session.sessionFile?.takeIf { guestFile(it).isFile }?.let { args += listOf("--session", it) }
+            session.provider?.let { args += listOf("--provider", it) }
+            session.model?.let { args += listOf("--model", it) }
+            session.thinkingLevel?.let { args += listOf("--thinking", it) }
+            args += configManager.extraArgs()
+            runtime.commandSpec(configManager.runtimeEnvExports() + "\nexport PI_CODING_AGENT_DIR=" + IdaProotRuntime.shellQuote(dir) + "\nexec " + args.joinToString(" ") { IdaProotRuntime.shellQuote(it) }, session.cwd.ifBlank { workspaceProotPath })
         }
-        if (dtos.isNotEmpty()) return dtos.toUiMessages()
-        // 旧 pi 格式兼容
-        val elements = lines.mapNotNull { line ->
-            val trimmed = line.trim()
-            if (trimmed.isBlank()) null else runCatching { json.parseToJsonElement(trimmed) }.getOrNull()
+        var launched: Process? = null
+        val process = try {
+            withContext(Dispatchers.IO) { ProcessBuilder(spec.command).directory(spec.workingDirectory).apply { environment().putAll(spec.environment) }.start().also { launched = it } }
+        } catch (e: CancellationException) { launched?.destroyForcibly(); throw e }
+        if (epoch != generation) { process.destroyForcibly(); throw CancellationException("Session changed") }
+        val rpc = PiRpcTransport(process,
+            onEvent = { event -> scope.launch {
+                if (epoch == generation) try { handleEvent(epoch, id, event) }
+                catch (e: Exception) { if (epoch == generation) fail(e.message ?: "PI event failed") }
+            } },
+            onFailure = { error -> scope.launch { if (epoch == generation) fail(error.message ?: "PI exited") } },
+            onStderr = { scope.launch { if (epoch == generation) _state.update { it.copy(stderrTail = "PI emitted diagnostic stderr. Raw output is hidden to protect credentials; command errors appear above.") } } })
+        transport = rpc; boundSession = id
+        val runtimeState = rpc.request("get_state")
+        session.autoCompactionEnabled?.let { rpc.request("set_auto_compaction", buildJsonObject { put("enabled", it) }) }
+        if (session.name.isNotBlank()) rpc.request("set_session_name", fields("name" to session.name))
+        persistRuntimeState(id, runtimeState)
+        if (_state.value.turnActive) {
+            val history = rpc.request("get_messages")
+            _state.update { it.copy(messages = normalizePiMessages((history["messages"] as? JsonArray).orEmpty())) }
         }
-        return normalizePiMessages(elements)
+        _state.update { it.copy(status = if (it.turnActive) "working" else "running", activity = if (it.turnActive) "正在发送…" else "PI 已就绪", error = null) }
+        return rpc
     }
 
-    private fun sessionFileToHostFile(sessionFile: String): File? {
-        val normalized = sessionFile.replace('\\', '/').trim()
-        val rel = when {
-            normalized.startsWith("$workspaceProotPath/") -> normalized.removePrefix("$workspaceProotPath/")
-            normalized.startsWith("/root/") -> return File(paths.rootfsDir, normalized.trimStart('/'))
-            normalized.startsWith("/") -> return File(paths.rootfsDir, normalized.trimStart('/'))
-            else -> normalized
+    private suspend fun persistRuntimeState(id: String, data: JsonObject) {
+        val model = data["model"] as? JsonObject
+        withContext(Dispatchers.IO) {
+            repo.patchSession(id) { record ->
+                val file = data.string("sessionFile") ?: record.sessionFile
+                record.copy(sessionFile = file, hasPersistedHistory = record.hasPersistedHistory == true || file?.let { guestFile(it).isFile } == true,
+                    provider = model?.string("provider") ?: record.provider, model = model?.string("id") ?: record.model,
+                    thinkingLevel = data.string("thinkingLevel") ?: record.thinkingLevel,
+                    autoCompactionEnabled = data.boolean("autoCompactionEnabled") ?: record.autoCompactionEnabled, status = "running", error = null)
+            }
         }
-        return File(paths.rootfsDir, "root/pi_workspace/$rel")
+        publishSessions()
     }
 
-    private fun setTurnActive(sessionId: String, active: Boolean) {
-        if (!active) {
-            // 本轮对话结束：把流式缓冲区里残余的 delta 强制 flush 干净，
-            // 确保最后一段文字不会因为节拍 flusher 还没到点而丢失。
-            finishStreamingFlush()
-        }
-        repo.updateRuntimeStatus(sessionId, if (active) "working" else "running", null)
-        _state.update { it.copy(
-            turnActive = active,
-            status = if (active) "working" else "running",
-            sessions = repo.listSessions(),
-            processingPhase = if (active) it.processingPhase else null,
-            promptSentAt = if (active) it.promptSentAt else 0L,
-            firstDeltaAt = if (active) it.firstDeltaAt else 0L
-        ) }
+    private suspend fun publishSessions() {
+        val sessions = withContext(Dispatchers.IO) { repo.listSessions() }
+        _state.update { old -> old.copy(sessions = sessions, modelLabel = modelLabel(sessions.firstOrNull { it.id == old.activeSessionId })) }
     }
+
+    private fun startMonitor(epoch: Long, id: String) {
+        if (monitor?.isActive == true) return
+        monitor = scope.launch {
+            try {
+                // Probe responsiveness, never impose an arbitrary maximum duration on valid tools.
+                while (epoch == generation && _state.value.turnActive) {
+                    delay(1500)
+                    val rpc = transport ?: break
+                    val data = rpc.request("get_state", timeoutMs = 15_000)
+                    if (epoch != generation) break
+                    if (!submitting && !retrying && !compacting && data.boolean("isStreaming") != true && data.boolean("isCompacting") != true && (data.int("pendingMessageCount") ?: 0) == 0) {
+                        finishTurn(id); break
+                    }
+                }
+            } catch (e: CancellationException) { if (epoch == generation && e is TimeoutCancellationException) fail("PI became unresponsive") }
+            catch (e: Exception) { if (epoch == generation) fail(e.message ?: "PI became unavailable") }
+        }
+    }
+
+    private fun finishTurn(id: String) {
+        val nextQueue = QueueState(queuedPrompts.filter { it.mode == "steer" }.map { it.displayText }, queuedPrompts.filter { it.mode == "followUp" }.map { it.displayText })
+        _state.update { it.copy(turnActive = nextQueue.steering.isNotEmpty() || nextQueue.followUp.isNotEmpty(), processingPhase = null, status = if (it.error == null) "running" else "error", activity = if (it.error == null) "已完成" else "本轮失败", activeQueue = nextQueue) }
+        streamingId = null
+        operation {
+            if (_state.value.activeSessionId == id && !_state.value.turnActive) {
+                readMessages(id)
+                val rpc = transport ?: return@operation
+                persistRuntimeState(id, rpc.request("get_state"))
+                val stats = rpc.request("get_session_stats")
+                _state.update { it.copy(activeStats = json.decodeFromJsonElement<SessionStats>(stats)) }
+            }
+        }
+    }
+
+    private suspend fun handleEvent(epoch: Long, id: String, event: JsonObject) {
+        if (id != _state.value.activeSessionId) return
+        when (event.string("type")) {
+            "agent_start" -> { _state.update { it.copy(turnActive = true, status = "working", processingPhase = "receiving") }; startMonitor(epoch, id) }
+            "agent_end" -> startMonitor(epoch, id)
+            "agent_settled" -> { retrying = false; compacting = false; finishTurn(id) }
+            "message_start" -> {
+                val message = event["message"] as? JsonObject ?: return
+                if (message.string("role") !in setOf("assistant", "user")) return
+                messageRevision++
+                if (message.string("role") == "user") {
+                    val index = queuedPrompts.indexOfFirst { it.wireText == contentToText(message["content"]) }
+                    if (index >= 0) { queuedPrompts.removeAt(index); publishQueue() }
+                }
+                streamingBase = _state.value.messages
+                streamingId = newMessageId()
+                if (message.string("role") == "assistant") appendMessage(ChatMessage(streamingId!!, "assistant", "", System.currentTimeMillis()))
+                else _state.update { it.copy(messages = streamingBase + normalizePiMessages(listOf(message))) }
+            }
+            "message_update" -> {
+                messageRevision++
+                val update = event["assistantMessageEvent"] as? JsonObject ?: return
+                val delta = update.string("delta").orEmpty()
+                if (update.string("type") in setOf("text_delta", "thinking_delta")) {
+                    val thinking = update.string("type") == "thinking_delta"
+                    _state.update { old -> old.copy(processingPhase = "receiving", firstDeltaAt = old.firstDeltaAt.takeIf { it > 0 } ?: System.currentTimeMillis(),
+                        messages = old.messages.map { message -> if (message.id == streamingId) {
+                            if (thinking) message.copy(thinking = message.thinking.orEmpty() + delta) else message.copy(text = message.text + delta)
+                        } else message }) }
+                }
+            }
+            "message_end" -> {
+                val message = event["message"] as? JsonObject ?: return
+                messageRevision++
+                if (message.string("role") in setOf("assistant", "user")) {
+                    _state.update { it.copy(messages = streamingBase + normalizePiMessages(listOf(message)).mapIndexed { index, item -> item.copy(id = "${streamingId ?: newMessageId()}-$index") }) }
+                }
+                if (message.string("role") == "assistant" && message.string("stopReason") == "error") {
+                    val error = configManager.redact(message.string("errorMessage") ?: "PI provider request failed")
+                    _state.update { it.copy(error = error, activity = error) }
+                }
+            }
+            "tool_execution_start", "tool_execution_update", "tool_execution_end" -> {
+                messageRevision++
+                val end = event.string("type") == "tool_execution_end"
+                val result = event["result"] ?: event["partialResult"]
+                _state.update { it.copy(processingPhase = "executing_tool") }
+                upsertTool(event.string("toolCallId") ?: return, event.string("toolName") ?: "tool", event["args"], result?.let(::resultToText), result?.let(::toolResultMeta), if (!end) "running" else if (event.boolean("isError") == true) "error" else "done")
+            }
+            "auto_retry_start", "summarization_retry_scheduled" -> { retrying = true; _state.update { it.copy(processingPhase = "connecting", activity = "PI 正在重试") } }
+            "auto_retry_end", "summarization_retry_finished" -> {
+                retrying = false
+                event.string("finalError")?.let { error -> _state.update { it.copy(error = configManager.redact(error)) } }
+            }
+            "auto_compaction_start", "compaction_start" -> { compacting = true; _state.update { it.copy(processingPhase = "compacting") } }
+            "auto_compaction_end", "compaction_end" -> {
+                compacting = false
+                event.string("errorMessage")?.let { error -> _state.update { it.copy(error = configManager.redact(error)) } }
+            }
+            "queue_update" -> _state.update { it.copy(activeQueue = QueueState(event.strings("steering"), event.strings("followUp"))) }
+            "extension_ui_request" -> {
+                if (event.string("method") in setOf("select", "confirm", "input", "editor")) {
+                    transport?.cancelExtensionDialog(event.string("id") ?: return)
+                    _state.update { it.copy(activity = "扩展交互已取消：此界面不支持扩展对话框") }
+                } else event.string("message")?.let { message -> _state.update { it.copy(activity = configManager.redact(message)) } }
+            }
+            "extension_error" -> _state.update { it.copy(error = configManager.redact(event.string("error") ?: "PI extension failed")) }
+        }
+    }
+
+    private fun JsonObject.strings(key: String) = (this[key] as? JsonArray).orEmpty().mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
+    private fun fields(vararg entries: Pair<String, String>) = JsonObject(entries.associate { it.first to JsonPrimitive(it.second) })
+    private fun guestFile(path: String): File = if (path == "/sdcard" || path.startsWith("/sdcard/") || path == "/storage" || path.startsWith("/storage/")) File(path)
+        else if (path.startsWith('/')) File(paths.rootfsDir, path.removePrefix("/")) else File(workspaceHostRoot, path)
+
+    private fun newMessageId(): String = java.util.UUID.randomUUID().toString()
 
     private fun appendMessage(message: ChatMessage) {
         _state.update { it.copy(messages = it.messages + message) }
     }
 
-    private fun appendSystemError(message: String) {
-        // 主动 abort 时不显示 abort 相关错误
-        if (suppressAbortError) {
-            // 匹配英文 "abort"/"cancelled" 和中文 "已中止"/"已取消"
-            if (message.contains("abort", ignoreCase = true) ||
-                message.contains("cancel", ignoreCase = true) ||
-                message.contains("已中止") ||
-                message.contains("已取消")) {
-                suppressAbortError = false
-                return
-            }
-        }
-        val text = formatAgentErrorMessage(message)
-        _state.update { old ->
-            if (old.messages.lastOrNull()?.let { it.role == "system" && it.text == text } == true) old
-            else old.copy(messages = old.messages + ChatMessage(newMessageId(), "system", text, System.currentTimeMillis()))
-        }
-    }
-
-    private fun applyAssistantDeltas(textDelta: String, thinkingDelta: String) {
-        deltaFlusher.apply(textDelta, thinkingDelta)
-    }
-
-    /** 结束本轮流式：强制 flush 残余 delta */
-    private fun finishStreamingFlush() {
-        deltaFlusher.finish()
-    }
-
-    /**
-     * 插入或更新工具调用消息。
-     *
-     * 线程安全说明：并行工具执行时多个 IO 线程可能同时调用此方法。
-     * MutableStateFlow.update 内部使用 CAS 循环，失败时自动重试，
-     * 因此每次 update 都基于最新状态，不会丢失更新（无 ABA 问题）。
-     * lambda 内的 toMutableList + indexOfFirst 是无副作用的纯操作，
-     * 重试时重复执行不会产生问题。
-     */
     private fun upsertTool(toolCallId: String, name: String, args: JsonElement?, result: String?, resultMeta: ToolResultMeta?, status: String) {
         _state.update { old ->
             val list = old.messages.toMutableList()
@@ -1025,167 +783,6 @@ class PiAgentManager(
 
     private fun setError(message: String) {
         _state.update { it.copy(error = message, activity = message, status = "error", turnActive = false, processingPhase = null, promptSentAt = 0L, firstDeltaAt = 0L) }
-    }
-
-    // ==================== 新架构：配置解析 + 事件映射 ====================
-
-    /**
-     * 从 PiConfigManager 解析出 ConversationEngine 需要的配置。
-     * 读取 API Key、Base URL、Model、System Prompt。
-     */
-    private suspend fun resolveConvConfig(sessionId: String, session: AgentSessionRecord): ConversationConfig? {
-        val snapshot = configManager.readSnapshot()
-        val userConfig = configManager.readUserConfig()
-
-        // Provider 映射
-        val rawProvider = (session.provider ?: snapshot.defaultProvider).trim()
-        val providerId = when (rawProvider) {
-            "custom", "openai-generic", "openai" -> "openai-generic"
-            else -> rawProvider
-        }.ifBlank { return null }
-
-        // 从 env 中找 API Key — 优先匹配 provider 对应的环境变量名
-        val envKeyForProvider = when (providerId) {
-            "openai-generic" -> listOf("OPENAI_API_KEY")
-            "anthropic" -> listOf("ANTHROPIC_API_KEY")
-            "deepseek" -> listOf("DEEPSEEK_API_KEY")
-            "google" -> listOf("GOOGLE_API_KEY", "GEMINI_API_KEY")
-            "openrouter" -> listOf("OPENROUTER_API_KEY")
-            "moonshot" -> listOf("MOONSHOT_API_KEY")
-            "dashscope" -> listOf("DASHSCOPE_API_KEY")
-            "ark" -> listOf("ARK_API_KEY")
-            "baidu" -> listOf("BAIDU_API_KEY")
-            "hunyuan" -> listOf("HUNYUAN_API_KEY")
-            "siliconflow" -> listOf("SILICONFLOW_API_KEY")
-            "mistral" -> listOf("MISTRAL_API_KEY")
-            "groq" -> listOf("GROQ_API_KEY")
-            "xai" -> listOf("XAI_API_KEY")
-            "together" -> listOf("TOGETHER_API_KEY")
-            else -> emptyList()
-        }
-        val apiKey = envKeyForProvider.firstNotNullOfOrNull { keyName ->
-            userConfig.env[keyName]?.takeIf { it.isNotBlank() }
-        } ?: userConfig.env.entries.firstOrNull { (_, v) -> v.isNotBlank() }?.value
-            ?: return null
-
-        // 从 models.json 找 Base URL — 尝试多个可能的 key
-        val modelsObj = runCatching {
-            dev.idadroid.util.JsonFormats.pretty.parseToJsonElement(snapshot.modelsText).let {
-                (it as? JsonObject)?.get("providers") as? JsonObject
-            }
-        }.getOrNull()
-        // 尝试 providerId 和原始 rawProvider 两种 key
-        val providerObj = modelsObj?.get(providerId) as? JsonObject
-            ?: modelsObj?.get(rawProvider) as? JsonObject
-            ?: modelsObj?.get("openai-generic") as? JsonObject
-            ?: modelsObj?.get("openai") as? JsonObject
-        val baseUrl = providerObj?.get("baseURL")?.jsonPrimitive?.contentOrNull
-            ?: providerObj?.get("baseUrl")?.jsonPrimitive?.contentOrNull
-            ?: when (providerId) {
-                "openai-generic" -> "https://api.openai.com/v1"
-                "deepseek" -> "https://api.deepseek.com/v1"
-                "anthropic" -> "https://api.anthropic.com/v1"
-                else -> return null
-            }
-
-        val model = (session.model ?: snapshot.defaultModel).trim().ifBlank { return null }
-        val thinkingLevel = session.thinkingLevel ?: snapshot.defaultThinkingLevel.trim().takeIf { it.isNotBlank() }
-        val systemPrompt = snapshot.appendSystem.ifBlank { defaultSystemAppendPrompt(workspaceProotPath) }
-
-        // Anthropic API 要求 max_tokens 必填，设置默认值
-        val maxTokens = if (providerId == "anthropic") 8192 else null
-
-        return ConversationConfig(
-            baseUrl = baseUrl,
-            apiKey = apiKey,
-            model = model,
-            providerId = providerId,
-            systemPrompt = systemPrompt,
-            thinkingLevel = thinkingLevel,
-            maxTokens = maxTokens
-        )
-    }
-
-    /**
-     * 将 Engine 事件映射到 UI 状态更新。
-     * 复用 DeltaFlusher / upsertTool 等现有机制。
-     */
-    private fun handleEngineEvent(sessionId: String, event: ConversationEvent, promptStartTime: Long) {
-        when (event) {
-            is ConversationEvent.TextDelta -> {
-                if (_state.value.firstDeltaAt == 0L) {
-                    _state.update { it.copy(firstDeltaAt = System.currentTimeMillis(), processingPhase = "receiving") }
-                }
-                applyAssistantDeltas(textDelta = event.text, thinkingDelta = "")
-            }
-            is ConversationEvent.ThinkingDelta -> {
-                if (_state.value.firstDeltaAt == 0L) {
-                    _state.update { it.copy(firstDeltaAt = System.currentTimeMillis(), processingPhase = "receiving") }
-                }
-                applyAssistantDeltas(textDelta = "", thinkingDelta = event.text)
-            }
-            is ConversationEvent.ToolCallStart -> {
-                finishStreamingFlush()
-                _state.update { it.copy(processingPhase = "executing_tool") }
-                upsertTool(
-                    toolCallId = event.toolCallId,
-                    name = event.toolName,
-                    args = runCatching { json.parseToJsonElement(event.args) }.getOrNull(),
-                    result = null,
-                    resultMeta = null,
-                    status = "running"
-                )
-            }
-            is ConversationEvent.ToolCallResult -> {
-                upsertTool(
-                    toolCallId = event.toolCallId,
-                    name = event.toolName,
-                    args = null,
-                    result = event.result,
-                    resultMeta = null,
-                    status = if (event.success) "done" else "error"
-                )
-            }
-            is ConversationEvent.StateChanged -> {
-                val phase = when (event.to) {
-                    is ConversationState.Connecting -> "connecting"
-                    is ConversationState.Streaming -> "receiving"
-                    is ConversationState.ExecutingTools -> "executing_tool"
-                    is ConversationState.Compacting -> "compacting"
-                    is ConversationState.Retrying -> "connecting"
-                    is ConversationState.Done, is ConversationState.Failed, is ConversationState.Aborted, ConversationState.Idle -> null
-                }
-                _state.update { it.copy(processingPhase = phase) }
-            }
-            is ConversationEvent.Error -> {
-                val message = when (val err = event.error) {
-                    is ConversationError.LlmError -> err.message
-                    is ConversationError.ToolError -> "工具 ${err.toolName} 错误: ${err.message}"
-                    is ConversationError.ToolTimeout -> "工具 ${err.toolName} 超时 (${err.timeoutMs / 1000}s)"
-                    is ConversationError.ContextOverflow -> "上下文溢出: ${err.estimatedTokens}/${err.limit} tokens"
-                    is ConversationError.MaxRoundsExceeded -> "工具调用轮次超过上限 (${err.rounds}/${err.max})"
-                    ConversationError.Aborted -> "对话已中止"
-                }
-                appendSystemError(message)
-            }
-            is ConversationEvent.TokenUsage -> {
-                _state.update { it.copy(
-                    activity = "Token 用量 — 输入: ${event.promptTokens} / 输出: ${event.completionTokens} / 总计: ${event.totalTokens}"
-                ) }
-            }
-            is ConversationEvent.Retrying -> {
-                appendMessage(ChatMessage(
-                    newMessageId(), "system",
-                    "网络重试中 (${event.attempt}/3)：${event.reason}，${event.delayMs / 1000}s 后重试...",
-                    System.currentTimeMillis()
-                ))
-            }
-            ConversationEvent.TurnComplete -> {
-                setTurnActive(sessionId, false)
-                repo.updateRuntimeStatus(sessionId, "running", null)
-                _state.update { it.copy(processingPhase = null, promptSentAt = 0L, firstDeltaAt = 0L) }
-            }
-        }
     }
 
     private fun workspaceFile(path: String): File {
@@ -1277,10 +874,4 @@ class PiAgentManager(
         session?.thinkingLevel?.takeIf { it.isNotBlank() }?.let { "thinking=$it" }
     ).joinToString(" / ")
 
-    private companion object {
-        /** 流式 delta 合并 flush 节拍，约 30fps：兼顾逐字流式的视觉流畅与状态更新开销。 */
-        const val STREAM_FLUSH_INTERVAL_MS = 33L
-        /** 单次 prompt 调用的超时时间。超过后中止并提示用户，避免 UI 永久卡在 working 状态。 */
-        const val PROMPT_TIMEOUT_MS = 180_000L // 3 分钟
-    }
 }

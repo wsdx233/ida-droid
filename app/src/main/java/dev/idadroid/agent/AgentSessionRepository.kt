@@ -36,13 +36,15 @@ class AgentSessionRepository(
     fun loadStore(): AgentSessionStore = synchronized(lock) { loadStoreInternal() }
 
     private fun loadStoreInternal(): AgentSessionStore = synchronized(lock) {
-        runCatching {
-            if (!storeFile.isFile) return@synchronized AgentSessionStore()
+        if (!storeFile.isFile) return@synchronized AgentSessionStore()
+        try {
             JsonFormats.pretty.decodeFromString<AgentSessionStore>(storeFile.readText())
-        }.getOrDefault(AgentSessionStore())
+        } catch (error: Exception) {
+            throw IllegalStateException("Session index cannot be read; original preserved", error)
+        }
     }
 
-    fun saveStore(store: AgentSessionStore) { saveStoreInternal(store) }
+    fun saveStore(store: AgentSessionStore) { requireSaved(saveStoreInternal(store)) }
 
     /** 写盘；失败返回 false（调用方决定抛错或降级）。 */
     private fun saveStoreInternal(store: AgentSessionStore): Boolean = synchronized(lock) {
@@ -50,12 +52,11 @@ class AgentSessionRepository(
             val file = storeFile
             file.parentFile?.mkdirs()
             val tmp = java.io.File(file.parentFile, "${file.name}.tmp")
-            tmp.writeText(JsonFormats.pretty.encodeToString(store))
-            if (!tmp.renameTo(file)) {
-                // renameTo 在某些文件系统上可能失败（如目标被占用），回退到 copy+delete
-                file.writeText(tmp.readText())
-                tmp.delete()
+            tmp.outputStream().use { output ->
+                output.write(JsonFormats.pretty.encodeToString(store).toByteArray(Charsets.UTF_8))
+                output.fd.sync()
             }
+            check(tmp.renameTo(file)) { "Cannot commit session index; original preserved" }
             true
         }.onFailure { error ->
             android.util.Log.w("AgentSessionRepository", "保存 agent 会话失败（路径=${storeFile.absolutePath}）", error)
@@ -82,8 +83,7 @@ class AgentSessionRepository(
             )
             val nextSessions = if (patched == existing) store.sessions else store.sessions.map { if (it.id == existing.id) patched else it }
             if (store.activeSessionId == existing.id && patched == existing) return@synchronized existing
-            // 自动兜底路径：静默保存失败，由后续显式操作（新建/切换）如实报错
-            saveStoreInternal(store.copy(sessions = nextSessions, activeSessionId = existing.id))
+            requireSaved(saveStoreInternal(store.copy(sessions = nextSessions, activeSessionId = existing.id)))
             return@synchronized patched
         }
         val now = Instant.now().toString()
@@ -98,8 +98,7 @@ class AgentSessionRepository(
             createdAt = now,
             updatedAt = now
         )
-        // 自动兜底路径：静默保存失败，由后续显式操作（新建/切换）如实报错
-        saveStoreInternal(AgentSessionStore(listOf(session), session.id))
+        requireSaved(saveStoreInternal(AgentSessionStore(listOf(session), session.id)))
         session
     }
 
@@ -152,12 +151,11 @@ class AgentSessionRepository(
         requireSaved(saveStoreInternal(store.copy(sessions = nextSessions, activeSessionId = nextActive)))
     }
 
-    fun updateRuntimeStatus(id: String, status: String, error: String? = null): AgentSessionRecord? = runCatching {
-        patchSession(id) { it.copy(status = status, error = error ?: it.error, lastActiveAt = Instant.now().toString()) }
-    }.getOrNull()
+    fun updateRuntimeStatus(id: String, status: String, error: String? = null): AgentSessionRecord =
+        patchSession(id) { it.copy(status = status, error = error, lastActiveAt = Instant.now().toString()) }
 
-    fun setSessionFile(id: String, sessionFile: String?): AgentSessionRecord? {
-        val value = sessionFile?.trim()?.takeIf { it.isNotBlank() } ?: return null
-        return runCatching { patchSession(id) { it.copy(sessionFile = value, lastActiveAt = Instant.now().toString()) } }.getOrNull()
+    fun setSessionFile(id: String, sessionFile: String?): AgentSessionRecord {
+        val value = sessionFile?.trim()?.takeIf { it.isNotBlank() } ?: error("PI did not provide a session file")
+        return patchSession(id) { it.copy(sessionFile = value, lastActiveAt = Instant.now().toString()) }
     }
 }

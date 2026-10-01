@@ -1,15 +1,15 @@
 package dev.idadroid.env
 
 import android.content.Context
-import android.net.ConnectivityManager
 import android.system.Os
+import android.system.OsConstants
 import java.io.File
 
 class RootfsConfigurator(private val context: Context) {
     fun configure(rootfsDir: File, hostTmpDir: File) {
         require(rootfsDir.isDirectory) { "rootfs directory does not exist: ${rootfsDir.absolutePath}" }
 
-        writeResolvConf(rootfsDir)
+        ensureResolverConfig(rootfsDir)
         writeHosts(rootfsDir)
         writeAptAndDpkgTweaks(rootfsDir)
         writeIdaDroidProfile(rootfsDir)
@@ -17,13 +17,32 @@ class RootfsConfigurator(private val context: Context) {
         writeFakeFips(rootfsDir)
     }
 
-    private fun writeResolvConf(rootfsDir: File) {
-        val dnsServers = queryDnsServers().ifEmpty { listOf("1.1.1.1", "8.8.8.8") }
-        File(rootfsDir, "etc/resolv.conf").apply {
-            parentFile?.mkdirs()
-            writeText(dnsServers.joinToString(separator = "\n") { "nameserver $it" } + "\n")
+    /** Repair imports from older versions too; never follows a guest symlink on the host. */
+    fun ensureResolverConfig(rootfsDir: File) {
+        val resolv = File(rootfsDir, "etc/resolv.conf")
+        resolv.parentFile?.mkdirs()
+        if (isSymbolicLink(resolv)) {
+            check(resolv.delete() && !isSymbolicLink(resolv)) {
+                "cannot replace symlink ${resolv.absolutePath} safely"
+            }
+        } else if (resolv.exists() && !resolv.isFile) {
+            check(resolv.delete() && !resolv.exists()) {
+                "cannot replace resolver node ${resolv.absolutePath} safely"
+            }
+        }
+        val content = resolverConfig()
+        if (!resolv.isFile || resolv.readText() != content) {
+            runCatching { Os.chmod(resolv.absolutePath, 384) }
+            resolv.writeText(content)
         }
     }
+
+    private fun resolverConfig(): String =
+        "nameserver 8.8.8.8\nnameserver 8.8.4.4\noptions use-vc timeout:2 attempts:2\n"
+
+    private fun isSymbolicLink(file: File): Boolean = runCatching {
+        OsConstants.S_ISLNK(Os.lstat(file.absolutePath).st_mode)
+    }.getOrDefault(false)
 
     private fun writeHosts(rootfsDir: File) {
         File(rootfsDir, "etc/hosts").apply {
@@ -67,17 +86,13 @@ class RootfsConfigurator(private val context: Context) {
     }
 
     private fun createTmpDirs(rootfsDir: File, hostTmpDir: File) {
-        listOf(
-            File(rootfsDir, "tmp"),
-            File(rootfsDir, "var/tmp"),
-            hostTmpDir
-        ).forEach { dir ->
+        listOf(File(rootfsDir, "tmp"), File(rootfsDir, "var/tmp"), hostTmpDir).forEach { dir ->
             dir.mkdirs()
-            runCatching { Os.chmod(dir.absolutePath, 511) } // 0777
+            runCatching { Os.chmod(dir.absolutePath, 511) }
         }
         File(rootfsDir, "tmp/runtime-root").apply {
             mkdirs()
-            runCatching { Os.chmod(absolutePath, 448) } // 0700
+            runCatching { Os.chmod(absolutePath, 448) }
         }
     }
 
@@ -87,11 +102,4 @@ class RootfsConfigurator(private val context: Context) {
             writeText("0\n")
         }
     }
-
-    private fun queryDnsServers(): List<String> = runCatching {
-        val cm = context.getSystemService(ConnectivityManager::class.java)
-        val network = cm.activeNetwork ?: return@runCatching emptyList()
-        val linkProperties = cm.getLinkProperties(network) ?: return@runCatching emptyList()
-        linkProperties.dnsServers.mapNotNull { address -> address.hostAddress }
-    }.getOrDefault(emptyList())
 }

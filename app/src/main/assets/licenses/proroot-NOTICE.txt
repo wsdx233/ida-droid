@@ -1,0 +1,17 @@
+proroot runtime provenance
+==========================
+
+Component: proroot v1.2.8
+Upstream: https://github.com/coderredlab/proroot
+Upstream release payload vendored without modification from:
+https://github.com/DSH-APP/DSHA/tree/v0.1.7-rc2/app/src/main/jniLibs/arm64-v8a
+
+The upstream README states: "Free to use in your projects. Redistribution of modified binaries is not permitted."
+IDAdroid ships the original arm64-v8a release libraries unchanged. This notice is not a grant of additional rights; consult the upstream license and README before redistribution.
+
+SHA-256 (verified at runtime before capability probing):
+a4e74d75b66cdc02b080adfe863dbf9951c3b30610d77beddc95488d5fe5de01  libproroot.so
+8c47a0a7db32d84c179ebb5bf3640f655a3181860ece5886ae44d92858730c34  libproroot-runtime.so
+51a0ec5bfed00e572a0de09e22d9057e2befc386b78e426613d3e0ab03f4ecee  libproroot-linker.so
+06c6624db3bdc45b9ced151cd781df439a37b47731d244b93e9d6a58cd48cde0  libproroot-stub-loader.so
+1c5bc9537a270e8bf8b1c70222813f57b60b828bfb5503ddf8fe37685092de2f  libproroot-bridge.so

@@ -40,9 +40,7 @@ codebase-memory-mcp 风格的持久记忆：`memory-store` 存储 key-value 形�
 
 ## UI 集成
 
-在 `ChatComposer` 的图标行下方添加了一个可点击的 Surface 作为"深度索引模式"开关。关闭时显示灰色提示文字"点击开启 CodeGraph / ECC / codebase-memory 联合工具链"；开启时变为 tertiaryContainer 配色，显示"已开启 · CodeGraph + ECC + Memory 联动分析"并带勾选图标。
-
-开关状态由 `BoxedAgentLikeScreen` 的 `deepIndexEnabled` 变量管理，用 `remember { mutableStateOf(false) }` 保持。切换时调用 `manager.enableDeepIndexMode()` 或 `manager.disableDeepIndexMode()`，后者通过 `DeepIndexToolChain.setEnabled` 更新状态流并触发 `PiAgentManager` 的 activity 提示。
+`AgentComposer` 的“更多”菜单提供深度索引开关。关闭时提示点击开启 CodeGraph / ECC / codebase-memory 联合工具链；开启时显示已启用状态。切换调用 `PiAgentManager.enableDeepIndexMode()` / `disableDeepIndexMode()`，并在 Agent 状态栏反馈当前模式。
 
 ## 设计取舍
 

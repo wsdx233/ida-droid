@@ -22,6 +22,7 @@ class EnvironmentManager(context: Context) {
     private val importer = RootfsImporter(appContext, paths)
     private val validator = RootfsValidator(appContext, paths)
     private val prootInstaller = ProotBinaryInstaller(appContext, paths)
+    private val configurator = RootfsConfigurator(appContext)
 
     private val _state = MutableStateFlow(loadState())
     val state: StateFlow<EnvironmentState> = _state.asStateFlow()
@@ -38,6 +39,7 @@ class EnvironmentManager(context: Context) {
 
     suspend fun revalidate(): ValidationReport = withContext(Dispatchers.IO) {
         prootInstaller.ensureInstalled()
+        if (paths.rootfsDir.isDirectory) configurator.ensureResolverConfig(paths.rootfsDir)
         val report = validator.validate()
         val old = metadataStore.load() ?: EnvironmentMetadata(envId = paths.envId)
         metadataStore.save(old.copy(validation = report))

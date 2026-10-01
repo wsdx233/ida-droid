@@ -1,5 +1,7 @@
 # 06 - agent / pi 聊天方案
 
+> 实现状态：本方案已落地但类名以当前代码为准。`PiRpcTransport` 取代草案中的 runtime/protocol 拆分，`PiAgentManager` 统一生命周期和状态机，`PiSessionMigration` 负责旧历史迁移；官方 PI 0.73.1 的命令与事件已用 JSONL smoke 验证。
+
 ## 目标
 
 在 Android App 内直接管理 proot 中的 `pi --mode rpc`，提供类似 BoxedAgent/BoxedAgentAndroid 的移动端聊天、session 管理、附件、tool card、thinking 展示，并让 agent 能通过 `mcpc` 调用 `ida-mcp` 辅助逆向。

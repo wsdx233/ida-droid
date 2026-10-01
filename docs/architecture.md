@@ -30,20 +30,17 @@ IDAdroid 是 Android 端 IDA Pro 逆向工程 + AI Agent 平台，通过 proot �
 idamcp-/
 ├── app/                          # 主应用模块
 │   └── src/main/java/dev/idadroid/
-│       ├── agent/                # AI 对话引擎 (核心)
-│       │   ├── ChatHttpClient.kt     # Layer 1: HTTPS SSE 流式对话
-│       │   ├── ToolEventBus.kt       # Layer 2: 工具执行总线
-│       │   ├── ConversationManager.kt # Layer 3: 对话编排器
-│       │   ├── PiAgentManager.kt     # UI 状态管理 + 事件分发
-│       │   ├── PiMessageNormalizer.kt # 消息格式标准化
-│       │   ├── PiConfigManager.kt    # Pi 配置管理
-│       │   ├── AiConfigTools.kt      # API 测试/模型拉取
-│       │   ├── EndpointCompleter.kt  # 端点 URL 自动补全
-│       │   ├── AttachmentManager.kt  # 附件管理
-│       │   ├── WorkspaceManager.kt   # 工作区文件管理
-│       │   ├── AgentSessionRepository.kt # Session 持久化
+│       ├── agent/                # PI RPC、Session、配置和工作区
+│       │   ├── PiRpcTransport.kt     # JSONL 请求关联、超时和失败闭合
+│       │   ├── PiAgentManager.kt     # 生命周期、事件、状态和 Session
+│       │   ├── PiSessionMigration.kt # 旧历史到 PI v3 tree 的安全迁移
+│       │   ├── PiMessageNormalizer.kt # PI 消息格式标准化
+│       │   ├── PiConfigManager.kt    # 运行时配置物化与凭据隔离
+│       │   ├── AttachmentManager.kt  # 附件读取、限制和容器存储
+│       │   ├── WorkspaceManager.kt   # SAF 工作区文件管理
+│       │   ├── AgentSessionRepository.kt # Session 原子持久化
 │       │   ├── AgentModelCatalog.kt   # 模型目录解析
-│       │   └── AgentModels.kt         # 数据模型
+│       │   └── AgentModels.kt         # Agent 状态和消息模型
 │       ├── proot/                # proot 运行时
 │       ├── env/                  # 环境管理
 │       ├── mcp/                  # MCP 客户端
@@ -57,91 +54,69 @@ idamcp-/
 └── docs/                         # 技术文档
 ```
 
-## AI 对话引擎架构 (三层分层)
+## Agent / PI RPC 架构
 
-### Layer 1: ChatHttpClient — 直接 HTTPS 对话客户端
+Android 不直接复制一套 LLM HTTP、工具循环或会话引擎。`PiAgentManager` 在 rootfs 内启动官方 `pi --mode rpc`，通过 `PiRpcTransport` 使用 JSONL stdin/stdout 通讯；PI 自己负责 Provider、模型请求和工具执行。
 
-**职责**: 直接调用 LLM API，处理 SSE 流式响应。
+### `PiRpcTransport`
 
-**支持的 Provider**:
-- OpenAI 兼容 (`/v1/chat/completions`)
-- Anthropic (`/v1/messages`)
-- Google Gemini (转换格式)
+- 每个请求生成 UUID，并按 `id` 与 `command` 关联响应；响应乱序不会串台。
+- stdout 只接受 JSONL；空行忽略，坏 JSON、无类型记录、未知响应和命令不匹配都会使当前 transport 失败闭合。
+- stderr 独立 drain，不与协议流混用；界面只显示脱敏诊断摘要。
+- 命令有独立 deadline；超时、EOF、进程退出和取消都会完成所有 pending 请求并终止进程。
+- 关闭顺序是 RPC abort（可用时）、销毁进程、有限等待、强制销毁；不会无限等待工具返回。
 
-**关键特性**:
-- 流式 SSE 解析（text/thinking/tool_call 增量）
-- 指数退避重试（429/5xx，最多 3 次）
-- 多格式错误解析（OpenAI/Anthropic/Google/Generic）
-- Token 使用量统计
-- Thinking/Reasoning 支持（DeepSeek-R1、Claude、o1 等）
+### `PiAgentManager`
 
-### Layer 2: ToolEventBus — 工具执行总线
+Manager 以 generation 隔离会话切换和旧进程回调，公开 `StateFlow<AgentUiState>`。发送采用同步 admission：只有消息/附件被当前会话接受后 UI 才清空草稿；模型未配置、rootfs 未 ready、当前 turn 不允许插入或 Manager 已关闭时返回 `false`，草稿保留。
 
-**职责**: 将 IDA/MCP/Shell 工具暴露为 OpenAI function calling 格式，执行 AI 发起的工具调用。
+状态流转：
 
-**内置工具**:
-- `run_shell`: 在 proot rootfs 内执行 shell 命令
-- `read_file`: 读取工作区文件
-- `write_file`: 写入工作区文件
-- `list_directory`: 列出目录内容
-
-**关键特性**:
-- 统一的成功/失败判断（`isToolResultSuccess()`）
-- 工具执行超时保护
-- 安全路径检查（防止越界访问）
-
-### Layer 3: ConversationManager — 对话编排器
-
-**职责**: 编排 Layer 1 + Layer 2，管理对话状态和工具调用循环。
-
-**核心循环**:
-```
-用户消息 → HTTPS chat → 收到 tool_calls → 执行工具 → 
-追加 tool 结果 → 再次 HTTPS chat → ... → finish_reason=stop
+```text
+idle/running
+  → connecting (prompt 已被接受)
+  → receiving / executing_tool / compacting
+  → running (agent_settled 或 get_state 确认无 streaming/pending)
+  → error/stopped (命令失败、EOF、超时或用户取消)
 ```
 
-**关键特性**:
-- Mutex 保护的线程安全状态管理
-- 上下文窗口管理（token 估算 + 自动截断）
-- 并行工具执行（多工具调用时）
-- 最多 50 轮工具调用（防止无限循环）
-- 单工具超时保护（120s）
-- Token 使用量累计统计
+Manager 处理 `agent_start/end/settled`、`message_*`、工具执行、重试、compact 和 queue 事件，维护当前消息、工具时间线、首个 delta 时间、队列和 session stats。`steer`/`follow-up` 只在 PI 报告支持时入队，不会把失败的草稿误报为已发送。
 
-### PiAgentManager — UI 状态管理
+### Session 与配置
 
-**职责**: 连接 ConversationManager 和 Compose UI，管理 UI 状态和消息展示。
+- `AgentSessionRepository` 以原子临时文件更新 `.idadroid/agent-sessions.json`，索引损坏或写盘失败会显式报错，不能静默覆盖用户数据。
+- PI session 文件位于 `.idadroid/pi-sessions/`；旧 IDAdroid JSONL 历史只在确认可转换后写入 PI v3 tree，原文件保持不变。
+- `PiConfigManager` 将用户配置物化到私有 runtime 目录，转换旧 `baseURL`/`envKey` 字段为 PI 的 `baseUrl`/`api`/`apiKey`，诊断消息会脱敏。受管理的 `--mode`、`--session` 和 session 目录参数不可被 extra args 覆盖。
 
-**关键特性**:
-- 30fps 流式 flush（33ms 节拍）
-- Session 持久化（创建/切换/删除/重命名）
-- 上下文压缩（保留近期消息 + 摘要）
-- 消息历史加载和恢复
-- 工作区文件管理
-- 附件处理（图片/文件）
+### Agent UI
+
+`AgentScreen` 使用 Material 3 响应式布局：宽屏显示 session rail，窄屏使用全屏 Sessions/Tools/Workspace/Configuration/Search 面板。消息列表支持工具/思考时间线、错误重试、保存回复、搜索跳转、近底部自动跟随和“回到最新”；用户上移时流式 delta 不抢回滚动位置。`AgentDraftStore` 将每个 session 的文本和附件放在应用私有目录，附件 materialize 在 IO dispatcher 完成。
+
+## proot / proroot 运行时
+
+`IdaProotRuntime` 在每次构造启动命令前调用 `RootfsConfigurator.ensureResolverConfig`。resolver 内容固定为：
+
+```text
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+options use-vc timeout:2 attempts:2
+```
+
+arm64 且五个随 APK 分发的 proroot `.so` 完整性校验通过、能力探测在 4 秒内成功时优先使用 proroot；否则选择现有 proot 并保留 `--kill-on-exit`。选择结果按 rootfs 和 payload 身份缓存，诊断明确报告回退原因。proroot 当前不提供 proot 等价的 descendant kill-on-exit 保证。
 
 ## 数据流
 
-### 发送消息流程
-
-```
-用户输入 → PiAgentManager.sendPrompt()
-  → ConversationManager.send()
-    → ChatHttpClient.chat() (SSE 流)
-      → TextDelta → PiAgentManager.applyAssistantDeltas()
-      → ThinkingDelta → PiAgentManager.applyAssistantDeltas()
-      → Finish(tool_calls) → ConversationManager.executeToolCallsParallel()
-        → ToolEventBus.execute() → ToolResult
-        → 追加 tool 消息 → 回到 ChatHttpClient.chat()
-      → Finish(stop) → TurnEnd
-  → PiAgentManager 更新 UI 状态
+```text
+AgentComposer
+  → PiAgentManager.sendPrompt() [同步 admission]
+  → PiRpcTransport.request("prompt")
+  → pi --mode rpc
+  → JSONL event
+  → generation/session guard
+  → AgentUiState / AgentScreen
 ```
 
-### 上下文管理策略
-
-1. **自动截断**: 当估算 token 数超过 `contextTokenLimit`（默认 32K）时，从中间移除早期消息
-2. **手动压缩**: 用户触发 `compact()`，保留最近 1/3 消息 + 生成摘要
-3. **保留配对**: 截断时不破坏 `tool_call` / `tool` 消息配对
+历史恢复通过 `get_messages`；运行时状态通过 `get_state`、`get_session_stats` 以及事件 settle 交叉确认，避免只依赖单个 UI 回调清除 loading 状态。
 
 ## 配置系统
 

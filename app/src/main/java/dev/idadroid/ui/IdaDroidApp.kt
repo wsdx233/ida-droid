@@ -33,11 +33,12 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -48,7 +49,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.idadroid.R
 import dev.idadroid.agent.DraftAttachment
-import dev.idadroid.agent.PiAgentManager
+import dev.idadroid.IdaDroidApplication
 import dev.idadroid.env.EnvironmentManager
 import dev.idadroid.env.ImportProgress
 import dev.idadroid.env.ImportStage
@@ -75,7 +76,7 @@ fun IdaDroidApp(
 ) {
     val context = LocalContext.current
     val settingsStore = remember { IdaDroidSettings(context.applicationContext) }
-    val appearance by settingsStore.appearanceSettings.collectAsState()
+    val appearance by settingsStore.appearanceSettings.collectAsStateWithLifecycle()
 
     val isDark = when (appearance.themeMode) {
         IdaDroidSettings.THEME_DARK -> true
@@ -95,19 +96,19 @@ fun IdaDroidApp(
         Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
             val manager = remember { EnvironmentManager(context.applicationContext) }
             val vncManager = remember { VncSessionManager(context.applicationContext, settingsStore) }
-            val agentManager = remember { PiAgentManager(context.applicationContext) }
+            val agentManager = (context.applicationContext as IdaDroidApplication).agentManager
             val fileManager = remember { ContainerFileManager(context.applicationContext) }
             val mcpManager = remember { IdaMcpSessionManager.get(context.applicationContext, settingsStore) }
-            val envState by manager.state.collectAsState()
-            val guiState by vncManager.state.collectAsState()
-            val agentState by agentManager.state.collectAsState()
-            val mcpState by mcpManager.state.collectAsState()
-            val vncSettings by settingsStore.vncSettings.collectAsState()
+            val envState by manager.state.collectAsStateWithLifecycle()
+            val guiState by vncManager.state.collectAsStateWithLifecycle()
+            val agentState by agentManager.state.collectAsStateWithLifecycle()
+            val mcpState by mcpManager.state.collectAsStateWithLifecycle()
+            val vncSettings by settingsStore.vncSettings.collectAsStateWithLifecycle()
             val scope = rememberCoroutineScope()
-            var currentScreen by remember { mutableStateOf(if (initialAgent) IdaDroidScreen.Agent else IdaDroidScreen.Home) }
+            var currentScreen by rememberSaveable { mutableStateOf(if (initialAgent) IdaDroidScreen.Agent else IdaDroidScreen.Home) }
             // React to Agent-screen requests arriving while the activity already
             // exists (floating window "Agent 聊天" routes through onNewIntent).
-            val agentRequestTick by (agentRequest ?: remember { MutableStateFlow(0) }).collectAsState()
+            val agentRequestTick by (agentRequest ?: remember { MutableStateFlow(0) }).collectAsStateWithLifecycle()
             LaunchedEffect(agentRequestTick) {
                 if (agentRequestTick > 0) currentScreen = IdaDroidScreen.Agent
             }
@@ -220,12 +221,13 @@ fun IdaDroidApp(
                     onShowMcpLog = { showMcpLog = true }
                 )
             } else if (currentScreen == IdaDroidScreen.Agent) {
-                BoxedAgentLikeScreen(
+                AgentScreen(
                     envReady = envState.isReady,
                     guiState = guiState,
                     agentState = agentState,
                     manager = agentManager,
                     onBack = { currentScreen = IdaDroidScreen.Home },
+                    onOpenEnvironment = { currentScreen = IdaDroidScreen.Home },
                     onLaunchGui = {
                         scope.launch {
                             if (guiState.status == GuiStatus.Starting) return@launch

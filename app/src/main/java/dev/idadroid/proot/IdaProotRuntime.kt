@@ -2,6 +2,7 @@ package dev.idadroid.proot
 
 import android.content.Context
 import dev.idadroid.env.EnvironmentPaths
+import dev.idadroid.env.RootfsConfigurator
 import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -16,7 +17,8 @@ class IdaProotRuntime(
 ) {
     private val appContext = context.applicationContext
     private val settings = dev.idadroid.settings.IdaDroidSettings(appContext)
-
+    private val proroot = ProrootSupport(appContext, paths, rootfsDir, hostTmpDir)
+    private val rootfsConfigurator = RootfsConfigurator(appContext)
     /** 用户设置的工作区路径（容器内可见路径） */
     private val workspacePath: String get() = settings.envSettings.value.workspacePath.ifBlank { DEFAULT_WORKSPACE }
 
@@ -70,60 +72,47 @@ class IdaProotRuntime(
     fun workspaceCommandSpec(script: String): LaunchSpec = commandSpec(script, cwd = workspacePath)
 
     suspend fun run(script: String, timeoutMs: Long = 120_000): CommandResult = withContext(Dispatchers.IO) {
-        val spec = commandSpec(script)
-        val processBuilder = ProcessBuilder(spec.command)
-            .directory(spec.workingDirectory)
-        processBuilder.environment().putAll(spec.environment)
+        runProcess(commandSpec(script), timeoutMs)
+    }
 
+    private fun runProcess(spec: LaunchSpec, timeoutMs: Long): CommandResult {
+        val processBuilder = ProcessBuilder(spec.command).directory(spec.workingDirectory)
+        processBuilder.environment().putAll(spec.environment)
         val process = processBuilder.start()
         val executor = Executors.newFixedThreadPool(2)
         val stdoutFuture = executor.submit<String> { process.inputStream.bufferedReader().use { it.readText() } }
         val stderrFuture = executor.submit<String> { process.errorStream.bufferedReader().use { it.readText() } }
-
-        val finished = process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
-        if (!finished) {
-            process.destroy()
-            if (!process.waitFor(1500, TimeUnit.MILLISECONDS)) process.destroyForcibly()
+        var finished = false
+        try {
+            finished = process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
+            if (!finished) terminate(process)
+            val exitCode = if (finished) process.exitValue() else -1
+            val stdout = runCatching { stdoutFuture.get(2, TimeUnit.SECONDS) }.getOrDefault("")
+            val stderr = runCatching { stderrFuture.get(2, TimeUnit.SECONDS) }.getOrDefault("")
+            return CommandResult(exitCode, stdout, stderr, timedOut = !finished)
+        } finally {
+            if (process.isAlive) terminate(process)
+            executor.shutdownNow()
         }
-        val exitCode = if (finished) process.exitValue() else -1
-        val stdout = runCatching { stdoutFuture.get(2, TimeUnit.SECONDS) }.getOrDefault("")
-        val stderr = runCatching { stderrFuture.get(2, TimeUnit.SECONDS) }.getOrDefault("")
-        executor.shutdownNow()
-        CommandResult(exitCode, stdout, stderr, timedOut = !finished)
+    }
+
+    private fun terminate(process: Process) {
+        process.destroy()
+        if (!runCatching { process.waitFor(1_500, TimeUnit.MILLISECONDS) }.getOrDefault(false)) process.destroyForcibly()
     }
 
     /** 便捷方法：执行单条命令，返回 stdout+stderr 合并文本 */
     suspend fun executeCommandWithTimeout(command: String, timeoutMs: Long = 60_000): String = withContext(Dispatchers.IO) {
-        // 使用 workspaceCommandSpec 确保命令在工作区目录执行
-        val spec = workspaceCommandSpec(command)
-        val processBuilder = ProcessBuilder(spec.command)
-            .directory(spec.workingDirectory)
-        processBuilder.environment().putAll(spec.environment)
-
-        val process = processBuilder.start()
-        val executor = Executors.newFixedThreadPool(2)
-        val stdoutFuture = executor.submit<String> { process.inputStream.bufferedReader().use { it.readText() } }
-        val stderrFuture = executor.submit<String> { process.errorStream.bufferedReader().use { it.readText() } }
-
-        val finished = process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
-        if (!finished) {
-            process.destroy()
-            if (!process.waitFor(1500, TimeUnit.MILLISECONDS)) process.destroyForcibly()
-        }
-        val exitCode = if (finished) process.exitValue() else -1
-        val stdout = runCatching { stdoutFuture.get(2, TimeUnit.SECONDS) }.getOrDefault("")
-        val stderr = runCatching { stderrFuture.get(2, TimeUnit.SECONDS) }.getOrDefault("")
-        executor.shutdownNow()
-        if (!finished) {
-            "错误: 命令超时 (${timeoutMs / 1000}s)\nstderr: $stderr"
-        } else if (exitCode != 0) {
-            "退出码: $exitCode\nstdout: $stdout\nstderr: $stderr"
-        } else {
-            stdout.ifBlank { stderr.ifBlank { "(无输出)" } }
-        }
+        val result = runProcess(workspaceCommandSpec(command), timeoutMs)
+        if (result.timedOut) {
+            "错误: 命令超时 (${timeoutMs / 1000}s)\nstderr: ${result.stderr}"
+        } else if (result.exitCode != 0) {
+            "退出码: ${result.exitCode}\nstdout: ${result.stdout}\nstderr: ${result.stderr}"
+        } else result.stdout.ifBlank { result.stderr.ifBlank { "(无输出)" } }
     }
 
     fun describe(spec: TerminalLaunchSpec): String = buildString {
+        appendLine("runtime=${proroot.diagnostics()}")
         appendLine("cwd=${spec.workingDirectory}")
         appendLine("env=${spec.environment.joinToString(" ") { shellQuote(it) }}")
         append("cmd=")
@@ -131,10 +120,41 @@ class IdaProotRuntime(
     }
 
     fun describe(spec: LaunchSpec): String = buildString {
+        appendLine("runtime=${proroot.diagnostics()}")
         appendLine("cwd=${spec.workingDirectory.absolutePath}")
         appendLine("env=${spec.environment.entries.joinToString(" ") { (key, value) -> shellQuote("$key=$value") }}")
         append("cmd=")
         append(spec.command.joinToString(" ") { shellQuote(it) })
+    }
+    private fun buildProotPrefix(term: String, cwd: String): MutableList<String> {
+        rootfsConfigurator.ensureResolverConfig(rootfsDir)
+        return when (proroot.select().kind) {
+            ProrootSupport.Kind.PROROOT -> proroot.prefix(ProrootSupport.Kind.PROROOT, resolveGuestWorkingDirectory(cwd)).apply {
+                addAll(listOf("/usr/bin/env", "-i"))
+            }
+            ProrootSupport.Kind.PROOT -> {
+                require(paths.prootBinary.isFile) { "proot binary is not installed: ${paths.prootBinary.absolutePath}" }
+                mutableListOf<String>().apply {
+                    addAll(listOf(paths.prootBinary.absolutePath, "-L", "--link2symlink", "--kill-on-exit", "--root-id", "-r", rootfsDir.absolutePath))
+                    listOf("/dev", "/proc", "/sys", "/storage", "/sdcard", "/mnt").forEach { hostPath ->
+                        if (File(hostPath).exists()) addAll(listOf("-b", hostPath))
+                    }
+                    listOf(
+                        "/dev/urandom" to "/dev/random",
+                        "/proc/self/fd" to "/dev/fd",
+                        hostTmpDir.absolutePath to "/tmp",
+                        hostTmpDir.absolutePath to "/var/tmp",
+                        appContext.filesDir.absolutePath to "/host/files",
+                        appContext.cacheDir.absolutePath to "/host/cache"
+                    ).forEach { (host, guest) -> if (File(host).exists()) addAll(listOf("-b", "$host:$guest")) }
+                    val fakeFips = File(rootfsDir, "proc/sys/crypto/fips_enabled")
+                    if (fakeFips.exists()) addAll(listOf("-b", "${fakeFips.absolutePath}:/proc/sys/crypto/fips_enabled"))
+                    val devShmSource = File(rootfsDir, "tmp")
+                    if (devShmSource.exists()) addAll(listOf("-b", "${devShmSource.absolutePath}:/dev/shm"))
+                    addAll(listOf("-w", resolveGuestWorkingDirectory(cwd), "/usr/bin/env", "-i"))
+                }
+            }
+        }.also { command -> guestEnvironment(term).forEach { (key, value) -> command += "$key=$value" } }
     }
 
     private fun interactiveLaunchSpec(term: String, cwd: String): LaunchSpec {
@@ -145,46 +165,6 @@ class IdaProotRuntime(
         return LaunchSpec(command, workingDirectory = paths.envDir.apply { mkdirs() }, environment = hostEnvironment())
     }
 
-    private fun buildProotPrefix(term: String, cwd: String): MutableList<String> {
-        require(paths.prootBinary.isFile) { "proot binary is not installed: ${paths.prootBinary.absolutePath}" }
-        require(rootfsDir.isDirectory) { "rootfs directory is missing: ${rootfsDir.absolutePath}" }
-        hostTmpDir.mkdirs()
-
-        val command = mutableListOf(
-            paths.prootBinary.absolutePath,
-            "-L",
-            "--link2symlink",
-            "--kill-on-exit",
-            "--root-id",
-            "-r",
-            rootfsDir.absolutePath
-        )
-
-        listOf("/dev", "/proc", "/sys", "/storage", "/sdcard", "/mnt").forEach { hostPath ->
-            if (File(hostPath).exists()) command += listOf("-b", hostPath)
-        }
-        listOf(
-            "/dev/urandom" to "/dev/random",
-            "/proc/self/fd" to "/dev/fd",
-            hostTmpDir.absolutePath to "/tmp",
-            hostTmpDir.absolutePath to "/var/tmp",
-            appContext.filesDir.absolutePath to "/host/files",
-            appContext.cacheDir.absolutePath to "/host/cache"
-        ).forEach { (host, guest) ->
-            if (File(host).exists()) command += listOf("-b", "$host:$guest")
-        }
-        val fakeFips = File(rootfsDir, "proc/sys/crypto/fips_enabled")
-        if (fakeFips.exists()) command += listOf("-b", "${fakeFips.absolutePath}:/proc/sys/crypto/fips_enabled")
-        val devShmSource = File(rootfsDir, "tmp")
-        if (devShmSource.exists()) command += listOf("-b", "${devShmSource.absolutePath}:/dev/shm")
-
-        command += listOf(
-            "-w", resolveGuestWorkingDirectory(cwd),
-            "/usr/bin/env", "-i"
-        )
-        guestEnvironment(term).forEach { (key, value) -> command += "$key=$value" }
-        return command
-    }
 
     private fun guestEnvironment(term: String): Map<String, String> = linkedMapOf(
         "HOME" to "/root",
@@ -264,7 +244,12 @@ class IdaProotRuntime(
         File(rootfsDir, "usr/bin/sh").exists() -> "/usr/bin/sh"
         else -> "/bin/sh"
     }
-
+    private fun hostEnvironment(): Map<String, String> = linkedMapOf(
+        "TMPDIR" to hostTmpDir.absolutePath,
+        "PROOT_TMP_DIR" to hostTmpDir.absolutePath
+    ).also { environment ->
+        if (proroot.select().kind == ProrootSupport.Kind.PROROOT) proroot.applyEnvironment(environment)
+    }
     private fun resolveGuestWorkingDirectory(requested: String): String {
         val normalized = requested.trim().ifBlank { "/root" }.let { if (it.startsWith('/')) it else "/$it" }
         if (guestPathToHost(normalized).isDirectory) return normalized
@@ -277,10 +262,6 @@ class IdaProotRuntime(
         return if (relative.isEmpty()) rootfsDir else File(rootfsDir, relative)
     }
 
-    private fun hostEnvironment(): Map<String, String> = mapOf(
-        "TMPDIR" to hostTmpDir.absolutePath,
-        "PROOT_TMP_DIR" to hostTmpDir.absolutePath
-    )
 
     companion object {
         const val DEFAULT_WORKSPACE = "/root/pi_workspace"
