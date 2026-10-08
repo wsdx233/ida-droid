@@ -21,6 +21,36 @@ data class AgentSessionRecord(
     val error: String? = null
 )
 
+/** A saved app preference wins; otherwise preserve the workspace's PI default. */
+internal fun resolveAgentDefaultThinking(appDefault: String?, piDefault: String): String =
+    appDefault?.trim()?.takeIf { it.isNotEmpty() } ?: piDefault.trim().ifBlank { "medium" }
+
+internal fun AgentSessionRecord.withAgentDefaults(thinking: String, autoCompaction: Boolean): AgentSessionRecord = copy(
+    thinkingLevel = thinkingLevel?.trim()?.takeIf { it.isNotEmpty() } ?: thinking,
+    autoCompactionEnabled = autoCompactionEnabled ?: autoCompaction
+)
+
+/** Replace just this stream's placeholder; concurrent users/tools are not a history snapshot. */
+internal fun mergeCompletedPiMessage(current: List<ChatMessage>, placeholderId: String, completed: List<ChatMessage>): List<ChatMessage> {
+    val out = current.toMutableList()
+    val position = out.indexOfFirst { it.id == placeholderId }
+    val role = out.getOrNull(position)?.role
+    if (position >= 0) out.removeAt(position)
+    val main = completed.firstOrNull { it.role == role || (role == null && it.role in setOf("assistant", "user")) }
+    val messages = completed.filter { it.role != "tool" }.mapIndexed { index, message ->
+        message.copy(id = if (message === main) placeholderId else "$placeholderId-extra-$index")
+    }
+    out.addAll(if (position >= 0) position else out.size, messages)
+    completed.filter { it.role == "tool" }.forEach { tool ->
+        val index = out.indexOfFirst { it.role == "tool" && it.toolCallId != null && it.toolCallId == tool.toolCallId }
+        if (index >= 0) {
+            val existing = out[index]
+            out[index] = existing.copy(toolName = existing.toolName ?: tool.toolName, toolArgs = existing.toolArgs ?: tool.toolArgs)
+        } else out += tool.copy(id = "$placeholderId-tool-${tool.toolCallId ?: out.size}")
+    }
+    return out
+}
+
 @Serializable
 data class AgentSessionStore(
     val sessions: List<AgentSessionRecord> = emptyList(),

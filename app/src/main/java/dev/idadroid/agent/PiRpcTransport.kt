@@ -144,12 +144,20 @@ class PiRpcTransport(
         terminate()
     }
 
+    /** Wait for readers/writers and the actual process exit before removing its rootfs. */
+    suspend fun closeAndJoin() {
+        close()
+        scope.coroutineContext[Job]!!.join()
+        withContext(Dispatchers.IO) { process.waitFor() }
+    }
+
     private fun terminate() {
         // Do not close the buffered writer synchronously: its monitor can be held by a blocked write.
         process.destroy()
         scope.launch {
             try {
                 if (!process.waitFor(1500, java.util.concurrent.TimeUnit.MILLISECONDS)) process.destroyForcibly()
+                process.waitFor()
             } finally {
                 runCatching { process.outputStream.close() }
                 runCatching { process.inputStream.close() }

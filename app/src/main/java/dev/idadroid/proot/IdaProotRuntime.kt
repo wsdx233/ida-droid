@@ -8,6 +8,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.runInterruptible
 
 class IdaProotRuntime(
     context: Context,
@@ -71,7 +72,7 @@ class IdaProotRuntime(
 
     fun workspaceCommandSpec(script: String): LaunchSpec = commandSpec(script, cwd = workspacePath)
 
-    suspend fun run(script: String, timeoutMs: Long = 120_000): CommandResult = withContext(Dispatchers.IO) {
+    suspend fun run(script: String, timeoutMs: Long = 120_000): CommandResult = runInterruptible(Dispatchers.IO) {
         runProcess(commandSpec(script), timeoutMs)
     }
 
@@ -102,7 +103,7 @@ class IdaProotRuntime(
     }
 
     /** 便捷方法：执行单条命令，返回 stdout+stderr 合并文本 */
-    suspend fun executeCommandWithTimeout(command: String, timeoutMs: Long = 60_000): String = withContext(Dispatchers.IO) {
+    suspend fun executeCommandWithTimeout(command: String, timeoutMs: Long = 60_000): String = runInterruptible(Dispatchers.IO) {
         val result = runProcess(workspaceCommandSpec(command), timeoutMs)
         if (result.timedOut) {
             "错误: 命令超时 (${timeoutMs / 1000}s)\nstderr: ${result.stderr}"

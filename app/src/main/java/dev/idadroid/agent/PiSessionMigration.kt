@@ -51,7 +51,11 @@ internal object PiSessionMigration {
     private fun convert(record: JsonObject, timestamp: Long, provider: String?, model: String?): JsonObject {
         val role = record["role"]?.jsonPrimitive?.contentOrNull
         require(role in setOf("user", "assistant", "tool", "system")) { "Unknown native history record; original preserved" }
-        val text = (record["content"] as? JsonPrimitive)?.contentOrNull.orEmpty()
+        val nativeContent = record["content"]
+        require(nativeContent == null || nativeContent == JsonNull || (nativeContent is JsonPrimitive && nativeContent.isString)) {
+            "Unsupported native history content; original preserved"
+        }
+        val text = (nativeContent as? JsonPrimitive)?.contentOrNull.orEmpty()
         val content = buildJsonArray {
             if (text.isNotEmpty()) add(buildJsonObject { put("type", "text"); put("text", text) })
             (record["images"] as? JsonArray).orEmpty().forEach { image ->

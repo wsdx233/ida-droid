@@ -7,6 +7,9 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
+import android.system.ErrnoException
+import android.system.Os
+import android.system.OsConstants
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.KeyEvent
@@ -18,15 +21,25 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import com.termux.terminal.TerminalColors
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
+import com.termux.terminal.TextStyle
 import com.termux.view.TerminalView
 import com.termux.view.TerminalViewClient
 import dev.idadroid.R
 import dev.idadroid.env.EnvironmentPaths
 import dev.idadroid.proot.IdaProotRuntime
 import dev.idadroid.proot.ProotBinaryInstaller
+import dev.idadroid.settings.IdaDroidSettings
+import dev.idadroid.settings.TerminalSettings
 import java.io.File
+import java.util.Properties
+import kotlin.math.roundToInt
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 
 class ProotTerminalActivity : ComponentActivity() {
     private var terminalSession: TerminalSession? = null
@@ -39,7 +52,8 @@ class ProotTerminalActivity : ComponentActivity() {
     private var altPressed = false
     private var ctrlButton: TextView? = null
     private var altButton: TextView? = null
-    private var textSizePx = 40
+    private var textSizePx = 0
+    private lateinit var terminalSettings: TerminalSettings
     private var launchSpec: IdaProotRuntime.TerminalLaunchSpec? = null
     private var initialCommandSent = false
 
@@ -125,7 +139,14 @@ class ProotTerminalActivity : ComponentActivity() {
         }
 
         override fun onBell(session: TerminalSession) = Unit
-        override fun onColorsChanged(session: TerminalSession) = Unit
+        override fun onColorsChanged(session: TerminalSession) {
+            if (::terminalView.isInitialized) {
+                val background = session.emulator?.mColors?.mCurrentColors?.get(TextStyle.COLOR_INDEX_BACKGROUND)
+                    ?: TerminalColors.COLOR_SCHEME.mDefaultColors[TextStyle.COLOR_INDEX_BACKGROUND]
+                terminalView.setBackgroundColor(background)
+                terminalView.invalidate()
+            }
+        }
         override fun onTerminalCursorStateChange(state: Boolean) = Unit
         override fun setTerminalShellPid(session: TerminalSession, pid: Int) {
             appendLog("session pid=$pid")
@@ -152,6 +173,9 @@ class ProotTerminalActivity : ComponentActivity() {
 
         paths = EnvironmentPaths.of(applicationContext)
         logStore = TerminalLogStore(applicationContext, paths)
+        terminalSettings = IdaDroidSettings(applicationContext).terminalSettings.value
+        textSizePx = spToPx(terminalSettings.fontSizeSp)
+        configureColorScheme()
         if (!prepareRuntime()) return
         bindLayout()
         startNewSession()
@@ -168,6 +192,36 @@ class ProotTerminalActivity : ComponentActivity() {
         terminalSession?.finishIfRunning()
         terminalSession = null
         super.onDestroy()
+    }
+
+    /** Wait for the terminal process before its rootfs is replaced or deleted. */
+    suspend fun stopForEnvironmentChange() = withContext(Dispatchers.Main.immediate) {
+        val session = terminalSession
+        // Detach the view so an unmeasured session cannot launch while stopping.
+        setContentView(TextView(this@ProotTerminalActivity).apply { text = "正在停止终端…" })
+        if (session != null && session.pid > 0 && session.isRunning) {
+            val pid = session.pid
+            // JNI creates a dedicated session with setsid(); stop its process group,
+            // not only the tracer, so the login shell is included in the shutdown.
+            try {
+                Os.kill(-pid, OsConstants.SIGTERM)
+            } catch (error: ErrnoException) {
+                if (error.errno != OsConstants.ESRCH) throw error
+            }
+            repeat(20) { if (session.isRunning) delay(50) }
+            if (session.isRunning) {
+                try {
+                    Os.kill(-pid, OsConstants.SIGKILL)
+                } catch (error: ErrnoException) {
+                    if (error.errno != OsConstants.ESRCH) throw error
+                }
+                session.finishIfRunning()
+            }
+            withTimeout(5_000) { while (session.isRunning) delay(20) }
+        }
+        terminalSession = null
+        launchSpec = null
+        finish()
     }
 
     private fun prepareRuntime(): Boolean {
@@ -193,7 +247,7 @@ class ProotTerminalActivity : ComponentActivity() {
 
         setupToolbar()
 
-        terminalView.setBackgroundColor(Color.BLACK)
+        terminalView.setBackgroundColor(TerminalColors.COLOR_SCHEME.mDefaultColors[TextStyle.COLOR_INDEX_BACKGROUND])
         terminalView.setTextSize(textSizePx)
         terminalView.keepScreenOn = true
         terminalView.isFocusable = true
@@ -217,6 +271,7 @@ class ProotTerminalActivity : ComponentActivity() {
         terminalSession?.let {
             it.updateTerminalSessionClient(terminalSessionClient)
             terminalView.attachSession(it)
+            terminalSessionClient.onColorsChanged(it)
             terminalView.onScreenUpdated()
         }
         terminalView.requestFocus()
@@ -248,7 +303,7 @@ class ProotTerminalActivity : ComponentActivity() {
     }
 
     private fun createTerminalSession(): TerminalSession {
-        val cwd = if (File(paths.rootfsDir, "root/pi_workspace").isDirectory) IdaProotRuntime.DEFAULT_WORKSPACE else "/root"
+        val cwd = resolveInitialCwd()
         val spec = IdaProotRuntime(applicationContext, paths).interactiveShellSpec(cwd = cwd)
         launchSpec = spec
         return TerminalSession(
@@ -260,6 +315,45 @@ class ProotTerminalActivity : ComponentActivity() {
             terminalSessionClient
         )
     }
+
+    private fun resolveInitialCwd(): String {
+        // Interpret all settings paths inside rootfs, including root-relative paths.
+        val requested = terminalSettings.initialCwd.trim()
+        if (requested.isNotEmpty()) {
+            val parts = mutableListOf<String>()
+            requested.split('/').forEach { part ->
+                when (part) {
+                    "", "." -> Unit
+                    ".." -> if (parts.isNotEmpty()) parts.removeAt(parts.lastIndex)
+                    else -> parts.add(part)
+                }
+            }
+            val relative = parts.joinToString("/")
+            val directory = if (relative.isEmpty()) paths.rootfsDir else File(paths.rootfsDir, relative)
+            if (directory.isDirectory) return "/$relative"
+        }
+        return when {
+            File(paths.rootfsDir, "root/pi_workspace").isDirectory -> IdaProotRuntime.DEFAULT_WORKSPACE
+            File(paths.rootfsDir, "root").isDirectory -> "/root"
+            else -> "/"
+        }
+    }
+
+    private fun configureColorScheme() {
+        val (background, foreground) = when (terminalSettings.colorScheme) {
+            "light" -> "#FAFAFA" to "#202020"
+            "solarized" -> "#002B36" to "#839496"
+            else -> "#000000" to "#FFFFFF"
+        }
+        // Use the emulator defaults as well as the View background so resets and
+        // plain shell output retain the selected scheme, not just the empty view.
+        TerminalColors.COLOR_SCHEME.updateWith(Properties().apply {
+            setProperty("background", background)
+            setProperty("foreground", foreground)
+            setProperty("cursor", foreground)
+        })
+    }
+
 
     private fun sendInitialCommandIfNeeded(delayMs: Long = 0) {
         val command = intent.getStringExtra(EXTRA_STARTUP_COMMAND)?.trim().orEmpty()
@@ -360,7 +454,7 @@ class ProotTerminalActivity : ComponentActivity() {
     }
 
     private fun changeTextSize(deltaPx: Int) {
-        textSizePx = (textSizePx + deltaPx).coerceIn(24, 72)
+        textSizePx = (textSizePx + deltaPx).coerceIn(spToPx(6), spToPx(32))
         if (::terminalView.isInitialized) terminalView.setTextSize(textSizePx)
         updateStatus()
     }
@@ -371,13 +465,13 @@ class ProotTerminalActivity : ComponentActivity() {
         val cwd = launchSpec?.args?.let { args ->
             val index = args.indexOf("-w")
             if (index >= 0) args.getOrNull(index + 1) else null
-        } ?: IdaProotRuntime.DEFAULT_WORKSPACE
+        } ?: "待启动"
         val state = when {
             session == null -> "未启动"
             session.isRunning -> "运行中 pid=${session.pid.takeIf { it > 0 } ?: "…"}"
             else -> "已退出 exit=${session.exitStatus}"
         }
-        statusText.text = "$state · $cwd · ${textSizePx}px"
+        statusText.text = "$state · 初始目录=$cwd · ${textSizePx}px"
     }
 
     private fun showLogView() {
@@ -492,6 +586,12 @@ class ProotTerminalActivity : ComponentActivity() {
     private fun toast(text: String) {
         Toast.makeText(this, text, Toast.LENGTH_SHORT).show()
     }
+
+    private fun spToPx(value: Int): Int = TypedValue.applyDimension(
+        TypedValue.COMPLEX_UNIT_SP,
+        value.toFloat(),
+        resources.displayMetrics
+    ).roundToInt().coerceAtLeast(1)
 
     private fun dp(value: Int): Int = TypedValue.applyDimension(
         TypedValue.COMPLEX_UNIT_DIP,

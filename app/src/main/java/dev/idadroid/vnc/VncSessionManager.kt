@@ -12,6 +12,7 @@ import dev.idadroid.settings.VncSettings
 import dev.idadroid.util.runCatchingSuspending
 import dev.idadroid.util.safePid
 import java.io.File
+import dev.idadroid.util.terminateAndWait
 import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -49,6 +50,7 @@ class VncSessionManager(
             // of the lock owns the state machine. Just report busy.
             return Result.failure(IllegalStateException("IDA GUI/VNC 正在启动或停止，请稍候…"))
         }
+        var launchedProcess: Process? = null
         try {
             val settings = settingsStore.vncSettings.value
             val startResult = withContext(Dispatchers.IO) {
@@ -71,13 +73,13 @@ class VncSessionManager(
                     startedAt = System.currentTimeMillis()
                 ) }
 
-                activeProcess?.takeIf { it.isAlive }?.destroy()
+                activeProcess?.terminateAndWait()
                 val command = buildStartCommand(settings)
                 val spec = runtime.workspaceCommandSpec(command)
                 val process = ProcessBuilder(spec.command)
                     .directory(spec.workingDirectory)
                     .also { it.environment().putAll(spec.environment) }
-                    .start()
+                    .start().also { launchedProcess = it }
                 activeProcess = process
                 pumpProcessOutput(process, supervisorLogFile())
 
@@ -111,6 +113,17 @@ class VncSessionManager(
                 }
             }
             return Result.success(_state.value)
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                launchedProcess?.let { process ->
+                    runCatching { process.terminateAndWait() }.onFailure(cancelled::addSuppressed)
+                    if (activeProcess === process) {
+                        activeProcess = null
+                        _state.update { it.copy(status = GuiStatus.Stopped, pid = null, message = "启动已取消") }
+                    }
+                }
+            }
+            throw cancelled
         } finally {
             startStopMutex.unlock()
         }
@@ -123,16 +136,12 @@ class VncSessionManager(
                 runCatchingSuspending {
             val settings = settingsStore.vncSettings.value
             materializeScripts(settings)
-            activeProcess?.let { process ->
-                if (process.isAlive) {
-                    process.destroy()
-                    if (!process.waitFor(2, TimeUnit.SECONDS)) process.destroyForcibly()
-                }
-            }
+            activeProcess?.terminateAndWait()
             activeProcess = null
             val stopCommand = buildStopCommand(settings)
             val result = runtime.run(stopCommand, timeoutMs = 20_000)
-            if (result.exitCode != 0 && !result.timedOut) {
+            check(!result.timedOut) { "停止 GUI 超时，环境保持不变" }
+            if (result.exitCode != 0) {
                 throw IllegalStateException("停止 GUI 失败：${result.stderr.ifBlank { result.stdout }}")
             }
                     _state.update { GuiSessionState(
@@ -149,7 +158,7 @@ class VncSessionManager(
     }
 
     suspend fun restartGui(openViewer: Boolean = true): Result<GuiSessionState> {
-        stopGui()
+        stopGui().getOrElse { return Result.failure(it) }
         return startGui(openViewer = openViewer)
     }
 

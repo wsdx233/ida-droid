@@ -18,7 +18,7 @@
 1. 每个 pending 请求都有唯一 ID，响应的 `command` 必须与请求一致。
 2. 超时、取消、stdout EOF、坏 JSON、进程退出和写入失败都会结束所有 pending 请求，不允许永久 loading。
 3. session 切换递增 generation；旧进程的事件不能写入新会话。
-4. `sendPrompt()` 是同步 admission：返回 `false` 时输入草稿和附件保留，只有返回 `true` 才允许 UI 清空。
+4. `sendPrompt()` 等待 `prompt` RPC ACK；返回 `false` 或被取消时输入草稿和附件保留，只有返回 `true` 且会话仍未切换时 UI 才清空本次提交快照。
 5. 合法的长工具调用不受任意整轮超时打断；连接、状态探测、普通命令和 compact 使用独立 deadline。
 
 ### 数据与凭据

@@ -137,6 +137,10 @@ class KeepAliveService : Service() {
         return builder.build()
     }
 
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        (application as? IdaDroidApplication)?.requestGuiStopOnAppExit()
+        super.onTaskRemoved(rootIntent)
+    }
     override fun onDestroy() {
         scope.cancel()
         super.onDestroy()

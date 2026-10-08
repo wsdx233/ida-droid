@@ -39,7 +39,7 @@ IDADROID_RELEASE_KEY_PASSWORD=***
 
 Provider 与模型由工作区私有的 `.idadroid/pi-agent/models.json` 管理。简易表单与完整编辑器使用同一 PI 原生结构，并保留未知 Provider、模型、compat、cost 等字段。`PiConfigManager.saveSnapshot()` 在写盘前验证全部配置并转换旧 `baseURL`/`envKey`；`materialize()` 为 PI 生成运行时配置并从 `env` 解析凭据，未解析的环境引用保留给 PI。不要把密钥写入日志、诊断或提交到仓库。
 
-外层 Provider 选择弹窗右上角的「＋」可新建任意数量的自定义 Provider。ID 必须唯一且不能覆盖内置预设；显示名称可以重复，列表同时显示 ID。每个 Provider 独立保存 URL、API Type、凭据和模型，取消新建不会修改草稿。
+外层 Provider 选择弹窗右上角的「＋」可新建任意数量的自定义 Provider。ID 必须唯一且不能覆盖内置预设；显示名称可以重复，列表同时显示 ID。每个 Provider 独立保存 URL、API Type、凭据和模型；Base URL 接受 `http://` 和 `https://`，不允许凭据、查询参数或片段。取消新建不会修改草稿。
 
 外层模型表单和新建 Provider 表单提供「支持思考/推理」开关，只应为实际支持推理的模型开启。该开关保存到同一个模型的 `reasoning` 字段；保存后重新启动 PI 生效。PI 会将不支持的思考强度钳制为可用级别，`chooseThinking()` 必须读取 `get_state.thinkingLevel` 再发布状态，不能把 RPC 成功当作强度已生效；不支持、钳制或失败时保留弹窗并显示原因。
 
@@ -81,7 +81,7 @@ PI 本身负责请求格式、重试、工具循环和 Provider 兼容性。Andr
 3. 是否影响 `turnActive`、`processingPhase`、队列或 session 持久化；
 4. 用户取消后是否清除 pending 状态，而不是一直显示 loading。
 
-发送入口 `sendPrompt()` 是同步 admission，返回 `false` 表示消息尚未被接受，UI 必须保留草稿。只有返回 `true` 后才允许清空草稿；附件 materialize 在 IO dispatcher 执行。
+发送入口 `sendPrompt()` 是挂起的 ACK 契约：只有 `prompt` RPC 成功响应后才返回 `true`，连接失败、附件写入失败、RPC 拒绝、超时、取消或会话切换均保留草稿。UI 只有在返回 `true` 且仍处于原会话时才清空该次提交快照；用户在等待期间的新输入不会被清除。附件 materialize 在 IO dispatcher 执行。
 
 ### 修改 System Prompt
 
@@ -105,6 +105,14 @@ piAgentManager.state.value.activeStats
 ### Runtime / DNS
 
 `IdaProotRuntime` 启动前会调用 `RootfsConfigurator.ensureResolverConfig()`。不要恢复 rootfs 内的绝对 `resolv.conf` symlink；配置器会先用 `lstat` 删除链接，再写入固定的 nameserver 与 `use-vc` 选项。arm64 设备优先使用完整性校验通过且 probe 成功的 proroot，其他情况使用带 `--kill-on-exit` 的 proot。
+
+`ProotBinaryInstaller` 按 ELF class/machine 与 `Build.SUPPORTED_ABIS` 选择 asset，而不是把通用 `proot` 当作全架构二进制。该列表包含设备实际宣告的 32 位和 native-bridge ABI；例如宣告 `x86_64,arm64-v8a` 的 emulator 可以选择现有 ARM64 asset，只有 `x86_64` 时必须明确报缺少兼容 binary。proot 自身不翻译 CPU 指令；ABI 匹配也不能代替设备上的运行 smoke。
+
+现有 `app/src/main/assets/proot` 保持不变：AArch64 ELF64 PIE，Android interpreter `/system/bin/linker64`，SHA-256 `2a4f643b087c2e88d290c8eb22b9382fab181e28358f4b332843a75b6556b365`，与本机 r2droid 的 `app/src/shared/assets/proot` 字节相同。原始上游构建版本/发布信息尚未记录；本次不增加 x86 payload，也不把该文件冒充 x86 binary。新增架构应提供真实 Android 兼容二进制到 `proot/<ABI>/proot` 并记录来源。
+
+安装以 target 的 canonical path 共享进程内锁；每次与所选 asset 的完整 SHA-256 比较，不能只检查非空或 executable。新副本写到同目录临时文件，sync、完整性比较和 chmod 成功后通过 rename 发布；失败保留原 target，下一次调用可恢复旧的截断副本。这里的哈希用于崩溃/并发完整性恢复，不是二进制安全认证。
+
+`RootfsValidator` 使用 `IdaDroidSettings.envSettings.idaHome` 的同一次快照构造 probe、报告和错误路径。rootfs `arch` 来自实际 shell ELF，不来自通常返回宿主架构的 `uname`。shell、首个 IDA 候选及 ida-mcp 的 ELF ABI 若已知且不在设备支持列表中即 fatal；脚本 wrapper、未知格式或不可读内容只报告「无法确认」，不能假称架构已验证。读取 rootfs ELF 时，绝对 symlink 必须按 guest 根目录解析。
 
 ## UI 开发指南
 

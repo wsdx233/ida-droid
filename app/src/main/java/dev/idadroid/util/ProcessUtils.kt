@@ -28,3 +28,13 @@ object ProcessUtils {
  * Convenience nullable-receiver wrapper around [ProcessUtils.pidOf].
      */
 fun Process?.safePid(): Int? = this?.let { ProcessUtils.pidOf(it) }
+
+/** Called on an IO thread; successful return means the child has exited. */
+internal fun Process.terminateAndWait() {
+    if (!isAlive) return
+    destroy()
+    if (!waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) {
+        destroyForcibly()
+        check(waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) { "子进程未能停止" }
+    }
+}

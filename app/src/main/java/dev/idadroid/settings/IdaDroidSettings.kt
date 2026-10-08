@@ -174,6 +174,11 @@ class IdaDroidSettings(context: Context) {
         prefs.edit { putString(KEY_AGENT_DEFAULT_THINKING, sanitizeSingleLine(level)) }
     }
 
+    /** An untouched app default must not override a workspace's PI preference. */
+    fun explicitAgentDefaultThinking(): String? = if (prefs.contains(KEY_AGENT_DEFAULT_THINKING)) {
+        agentSettings.value.defaultThinkingLevel
+    } else null
+
     fun updateAgentAutoCompaction(enabled: Boolean) {
         prefs.edit { putBoolean(KEY_AGENT_AUTO_COMPACTION, enabled) }
     }

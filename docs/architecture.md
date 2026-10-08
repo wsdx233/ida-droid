@@ -68,13 +68,13 @@ Android 不直接复制一套 LLM HTTP、工具循环或会话引擎。`PiAgentM
 
 ### `PiAgentManager`
 
-Manager 以 generation 隔离会话切换和旧进程回调，公开 `StateFlow<AgentUiState>`。发送采用同步 admission：只有消息/附件被当前会话接受后 UI 才清空草稿；模型未配置、rootfs 未 ready、当前 turn 不允许插入或 Manager 已关闭时返回 `false`，草稿保留。
+Manager 以 generation 隔离会话切换和旧进程回调，公开 `StateFlow<AgentUiState>`。发送采用 `prompt` RPC ACK 契约：只有消息/附件被 PI 确认接收后 UI 才清空本次提交快照；模型未配置、rootfs 未 ready、当前 turn 不允许插入、RPC 失败/超时/取消或 Manager 已关闭时返回 `false`，草稿保留。
 
 状态流转：
 
 ```text
 idle/running
-  → connecting (prompt 已被接受)
+  → connecting (等待 prompt ACK)
   → receiving / executing_tool / compacting
   → running (agent_settled 或 get_state 确认无 streaming/pending)
   → error/stopped (命令失败、EOF、超时或用户取消)
@@ -110,7 +110,7 @@ arm64 且五个随 APK 分发的 proroot `.so` 完整性校验通过、能力探
 
 ```text
 AgentComposer
-  → PiAgentManager.sendPrompt() [同步 admission]
+  → PiAgentManager.sendPrompt() [等待 prompt RPC ACK]
   → PiRpcTransport.request("prompt")
   → pi --mode rpc
   → JSONL event
@@ -139,7 +139,7 @@ AgentComposer
 
 ### 模型目录 (`models.json`)
 
-使用 PI 原生 `baseUrl`、`api`、`apiKey` 和模型列表，支持凭据环境变量引用；简易表单与完整编辑器均保留 Provider、模型、compat、headers 等扩展字段。配置保存等待实际写盘与运行时物化完成，失败不发布新快照或关闭编辑器。
+使用 PI 原生 `baseUrl`、`api`、`apiKey` 和模型列表，支持凭据环境变量引用；Base URL 支持 `http://` 与 `https://`，简易表单与完整编辑器均保留 Provider、模型、compat、headers 等扩展字段。配置保存等待实际写盘与运行时物化完成，失败不发布新快照或关闭编辑器。
 
 外层选择器支持独立 ID 的多个自定义 Provider；模型的 `reasoning` 能力由用户明确声明。思考强度选择以 PI 返回的实际 `thinkingLevel` 为准，不支持或被钳制时不会伪装成已应用。
 

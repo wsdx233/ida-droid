@@ -429,7 +429,7 @@ private fun ProviderDetailsCard(provider: ProviderDraft, onDelete: () -> Unit) {
                 value = provider.baseUrl,
                 onValueChange = { provider.baseUrl = it },
                 label = { Text("Base URL") },
-                placeholder = { Text("https://...") },
+                placeholder = { Text("http:// 或 https://...") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth()
             )

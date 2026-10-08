@@ -129,7 +129,6 @@ class MainActivity : ComponentActivity() {
 
         val prefs = getSharedPreferences("startup-permissions", MODE_PRIVATE)
         if (prefs.getBoolean("battery_optimization_requested", false)) return
-        prefs.edit().putBoolean("battery_optimization_requested", true).apply()
 
         val packageUri = "package:$packageName".toUri()
         val intents = listOf(
@@ -137,11 +136,21 @@ class MainActivity : ComponentActivity() {
             Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS),
             Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply { data = packageUri }
         )
-        val intent = intents.firstOrNull { it.resolveActivity(packageManager) != null } ?: return
-        try {
-            startActivity(intent)
-        } catch (_: ActivityNotFoundException) {
-            // Some OEM builds hide the battery optimization settings. Keep the app usable.
+        for (intent in intents) {
+            if (intent.resolveActivity(packageManager) == null) continue
+            try {
+                startActivity(intent)
+                // Record only after Android accepted the launch. If no activity is
+                // available or the OEM rejects it, the next startup may retry.
+                prefs.edit().putBoolean("battery_optimization_requested", true).apply()
+                return
+            } catch (_: ActivityNotFoundException) {
+                // Try the next compatible settings page on OEM builds that race
+                // package resolution or hide the resolved component.
+            } catch (_: RuntimeException) {
+                // A resolved activity can still reject the launch (for example via
+                // a vendor security policy); try a more general fallback.
+            }
         }
     }
 }

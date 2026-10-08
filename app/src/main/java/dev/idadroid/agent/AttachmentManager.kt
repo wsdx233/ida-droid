@@ -160,7 +160,7 @@ class AttachmentManager(
             throw IllegalArgumentException("文件路径必须位于 $ws 内：$input")
         }
         val rel = abs.removePrefix(ws).trimStart('/')
-        val hostRoot = if (ws.startsWith("/root/")) File(paths.rootfsDir, ws.removePrefix("/")) else File(ws)
+        val hostRoot = File(paths.rootfsDir, ws.removePrefix("/"))
         return WorkspaceRef(abs, if (rel.isBlank()) hostRoot else File(hostRoot, rel))
     }
 

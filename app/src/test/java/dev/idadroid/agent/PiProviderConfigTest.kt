@@ -48,6 +48,12 @@ class PiProviderConfigTest {
         }
     }
 
+    @Test fun acceptsHttpProviderBaseUrlForLocalProvider() {
+        val config = """{"providers":{"local":{"baseUrl":"HTTP://127.0.0.1:8080/v1","api":"openai-completions"}}}"""
+        val parsed = parsePiModels(config)
+        assertEquals("HTTP://127.0.0.1:8080/v1", parsed.getValue("providers").jsonObject.getValue("local").jsonObject.getValue("baseUrl").jsonPrimitive.content)
+    }
+
     @Test fun incompleteUrlCanRemainInDraftButCannotPassSaveValidation() {
         val draft = """{"providers":{"custom":{"baseUrl":"https://","apiKey":"secret"}}}"""
         assertEquals("https://", parsePiModels(draft, validateValues = false).getValue("providers").jsonObject.getValue("custom").jsonObject.getValue("baseUrl").jsonPrimitive.content)

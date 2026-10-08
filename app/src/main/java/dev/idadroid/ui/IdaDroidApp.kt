@@ -55,6 +55,7 @@ import dev.idadroid.R
 import dev.idadroid.agent.DraftAttachment
 import dev.idadroid.IdaDroidApplication
 import dev.idadroid.env.EnvironmentManager
+import dev.idadroid.env.EnvironmentPaths
 import dev.idadroid.env.ImportProgress
 import dev.idadroid.env.ImportStage
 import dev.idadroid.files.ContainerFileManager
@@ -63,6 +64,7 @@ import dev.idadroid.mcp.IdaMcpSessionManager
 import dev.idadroid.settings.IdaDroidSettings
 import dev.idadroid.terminal.ProotTerminalActivity
 import dev.idadroid.terminal.TerminalLogStore
+import dev.idadroid.util.runCatchingSuspending
 import dev.idadroid.vnc.GuiStatus
 import dev.idadroid.vnc.VncSessionManager
 import kotlinx.coroutines.Dispatchers
@@ -124,6 +126,7 @@ fun IdaDroidApp(
                 if (agentRequestTick > 0) currentScreen = IdaDroidScreen.Agent
             }
             var importProgress by remember { mutableStateOf<ImportProgress?>(null) }
+            var environmentMutationBusy by remember { mutableStateOf(false) }
             var validationBusy by remember { mutableStateOf(false) }
             var transientMessage by remember { mutableStateOf<String?>(null) }
             var showTerminalDiagnostics by remember { mutableStateOf(false) }
@@ -131,12 +134,31 @@ fun IdaDroidApp(
             var showMcpLog by remember { mutableStateOf(false) }
             var pendingAttachments by remember { mutableStateOf<List<DraftAttachment>>(emptyList()) }
 
+            suspend fun stopEnvironmentRuntime() {
+                val errors = mutableListOf<String>()
+                suspend fun stopComponent(name: String, stop: suspend () -> Unit) {
+                    runCatchingSuspending { stop() }
+                        .exceptionOrNull()?.let { errors += "$name：${it.message ?: it::class.java.simpleName}" }
+                }
+                stopComponent("PI") { agentManager.stopForEnvironmentChange() }
+                stopComponent("终端") { application.stopTerminalsForEnvironmentChange() }
+                // 首次导入没有 rootfs，不能运行容器内的 MCP/VNC 停止脚本。
+                val hasRootfs = withContext(Dispatchers.IO) {
+                    EnvironmentPaths.of(context.applicationContext).rootfsDir.isDirectory
+                }
+                if (hasRootfs) {
+                    stopComponent("MCP") { mcpManager.stop().getOrThrow() }
+                    stopComponent("VNC") { vncManager.stopGui().getOrThrow() }
+                }
+                check(errors.isEmpty()) { "运行时停止失败，环境未修改：${errors.joinToString("；")}" }
+            }
+
             LaunchedEffect(Unit) {
                 manager.refresh()
                 agentManager.refresh()
             }
-            LaunchedEffect(envState, vncSettings.port) {
-                if (envState.isReady) {
+            LaunchedEffect(envState, vncSettings.port, environmentMutationBusy) {
+                if (envState.isReady && !environmentMutationBusy) {
                     vncManager.probe()
                     mcpManager.probe()
                     agentManager.refresh(createDefaultIfReady = true)
@@ -152,8 +174,25 @@ fun IdaDroidApp(
             val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
                 if (uri != null) {
                     scope.launch {
-                        importProgress = ImportProgress(ImportStage.Preflight, 0f, "准备导入")
-                        manager.importRootfs(uri).collect { progress -> importProgress = progress }
+                        if (environmentMutationBusy || validationBusy) return@launch
+                        environmentMutationBusy = true
+                        importProgress = ImportProgress(ImportStage.Preflight, 0f, "正在停止旧环境运行时")
+                        try {
+                            runCatchingSuspending {
+                                stopEnvironmentRuntime()
+                                manager.importRootfs(uri).collect { progress -> importProgress = progress }
+                            }.onFailure { error ->
+                                importProgress = ImportProgress(
+                                    ImportStage.Error, null, "导入未完成",
+                                    logs = importProgress?.logs.orEmpty(),
+                                    error = error.message ?: error::class.java.simpleName
+                                )
+                                transientMessage = "导入未完成：${error.message}"
+                            }
+                        } finally {
+                            if (importProgress?.isRunning == true) importProgress = null
+                            environmentMutationBusy = false
+                        }
                     }
                 }
             }
@@ -233,6 +272,11 @@ fun IdaDroidApp(
                 val progress = importProgress
                 if (progress?.isRunning == true) {
                 ImportProgressAnalysisScreen(progress)
+            } else if (environmentMutationBusy) {
+                Column(Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) {
+                    CircularProgressIndicator()
+                    Text("正在停止运行时并删除环境…", modifier = Modifier.padding(top = 16.dp))
+                }
             } else if (currentScreen == IdaDroidScreen.Settings) {
                 BackHandler { currentScreen = IdaDroidScreen.Home }
                 SettingsScreen(
@@ -376,20 +420,22 @@ fun IdaDroidApp(
                     },
                     onDelete = {
                         scope.launch {
-                            // 即使 MCP/VNC 停止失败也继续删除环境，避免残留状态；
-                            // 但把异常汇总展示给用户，避免静默失败造成误解。
-                            // 注意：必须使用 runCatchingSuspending，普通 runCatching 会
-                            // 吞掉 CancellationException 破坏协程取消语义。
-                            val errors = buildList {
-                                dev.idadroid.util.runCatchingSuspending { mcpManager.stop() }
-                                    .exceptionOrNull()?.let { add("MCP: ${it.message}") }
-                                dev.idadroid.util.runCatchingSuspending { vncManager.stopGui() }
-                                    .exceptionOrNull()?.let { add("VNC: ${it.message}") }
-                                dev.idadroid.util.runCatchingSuspending { manager.deleteEnvironment() }
-                                    .exceptionOrNull()?.let { add("Env: ${it.message}") }
+                            if (environmentMutationBusy || validationBusy) return@launch
+                            environmentMutationBusy = true
+                            transientMessage = null
+                            try {
+                                runCatchingSuspending {
+                                    stopEnvironmentRuntime()
+                                    manager.deleteEnvironment()
+                                }.onSuccess {
+                                    importProgress = null
+                                    transientMessage = "已删除 active 环境"
+                                }.onFailure { error ->
+                                    transientMessage = "删除 active 环境失败：${error.message}"
+                                }
+                            } finally {
+                                environmentMutationBusy = false
                             }
-                            importProgress = null
-                            transientMessage = if (errors.isEmpty()) "已删除 active 环境" else "已删除 active 环境（部分组件异常：${errors.joinToString("；")}）"
                         }
                     }
                 )

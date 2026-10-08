@@ -40,6 +40,10 @@ class PiAgentManager(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     // Workspace observation must survive disconnect(), which cancels PI operations.
     private val workspaceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val workspaceTasks = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val retiredTransports = mutableSetOf<PiRpcTransport>()
+    private var environmentStopped = false
+    private var stoppingEnvironment = false
     private val operations = Mutex()
     private val json = Json { ignoreUnknownKeys = true }
     private val _state = MutableStateFlow(AgentUiState(activity = "PI 未启动"))
@@ -56,7 +60,7 @@ class PiAgentManager(
     private var compacting = false
     private var monitor: Job? = null
     private var streamingId: String? = null
-    private var streamingBase = emptyList<ChatMessage>()
+    private val streamingMessages = mutableMapOf<String, String>()
     private var closed = false
     private var workspaceListing: Job? = null
     private var workspaceListingRevision = 0L
@@ -65,6 +69,7 @@ class PiAgentManager(
         workspaceScope.launch {
             settings.envSettings.map { it.workspacePath.ifBlank { dev.idadroid.settings.IdaDroidSettings.DEFAULT_WORKSPACE_PATH } }
                 .distinctUntilChanged().drop(1).collect { path ->
+                    if (environmentStopped) return@collect
                     disconnect()
                     _state.value = AgentUiState(activity = "工作区已切换，正在读取配置与会话",
                         workspace = WorkspaceState(workspacePath = path))
@@ -81,24 +86,68 @@ class PiAgentManager(
     }
 
     /** Application-owned: never close on screen/activity recreation. */
-    override fun close() { closed = true; disconnect(); scope.cancel(); workspaceScope.cancel() }
+    override fun close() { closed = true; disconnect(); scope.cancel(); workspaceScope.cancel(); workspaceTasks.cancel() }
 
     private fun disconnect() {
         generation++
         scope.coroutineContext.cancelChildren()
         monitor?.cancel(); monitor = null
-        transport?.close(); transport = null; boundSession = null
+        transport?.let { rpc ->
+            retiredTransports += rpc
+            rpc.close()
+            workspaceScope.launch { rpc.closeAndJoin(); retiredTransports.remove(rpc) }
+        }
+        transport = null; boundSession = null
         submitting = false; retrying = false; compacting = false
         queuedPrompts.clear()
-        streamingId = null; streamingBase = emptyList()
+        streamingId = null; streamingMessages.clear()
         _state.update { it.copy(turnActive = false, processingPhase = null, messagesLoading = false, modelLoading = false, activeQueue = QueueState()) }
+    }
+
+    /** Quiesce, but keep this application-owned manager reusable after an explicit refresh. */
+    suspend fun stopForEnvironmentChange() = withContext(Dispatchers.Main.immediate + NonCancellable) {
+        stoppingEnvironment = true
+        environmentStopped = true
+        val pending = scope.coroutineContext[Job]!!.children.toList() +
+            workspaceTasks.coroutineContext[Job]!!.children.toList()
+        disconnect()
+        workspaceListingRevision++
+        workspaceTasks.coroutineContext.cancelChildren()
+        try {
+            pending.joinAll() // Includes blocking IO children; joining never blocks the UI thread.
+            retiredTransports.toList().forEach { it.closeAndJoin() }
+            retiredTransports.clear()
+            _state.value = AgentUiState(activity = "环境已停止，请刷新后重新连接")
+        } finally { stoppingEnvironment = false }
+    }
+
+    // UI-owned suspend calls must also be children of the manager so environment teardown
+    // can cancel and join every file writer, not just queued PI commands.
+    private suspend fun <T> managedTask(block: suspend () -> T): T = withContext(Dispatchers.Main.immediate) {
+        check(!closed && !environmentStopped) { "Agent 环境已停止，请刷新后重试" }
+        val epoch = generation
+        val task = scope.async { block() }
+        try { val result = task.await(); ensureCurrent(epoch); result }
+        catch (error: CancellationException) {
+            withContext(NonCancellable) { task.cancelAndJoin() }
+            throw error
+        }
+    }
+
+    private suspend fun <T> managedIO(block: suspend () -> T): T = managedTask { withContext(Dispatchers.IO) { block() } }
+
+    private suspend fun ensureCurrent(epoch: Long, id: String? = null) {
+        currentCoroutineContext().ensureActive()
+        if (epoch != generation || environmentStopped || closed || (id != null && id != _state.value.activeSessionId))
+            throw CancellationException("Session or environment changed")
     }
 
     private fun operation(block: suspend () -> Unit) {
         val epoch = generation
+        if (closed || environmentStopped) return
         scope.launch {
             operations.withLock {
-                if (closed || epoch != generation) return@withLock
+                if (closed || environmentStopped || epoch != generation) return@withLock
                 try { block() }
                 catch (e: CancellationException) {
                     if (epoch == generation && e is TimeoutCancellationException) fail("PI command timed out")
@@ -111,7 +160,10 @@ class PiAgentManager(
 
     private fun fail(message: String) { val safe = configManager.redact(message); disconnect(); setError(safe) }
 
-    fun refresh(createDefaultIfReady: Boolean = false) = operation {
+    fun refresh(createDefaultIfReady: Boolean = false) {
+        if (closed || stoppingEnvironment) return
+        environmentStopped = false
+        operation {
         if (!paths.rootfsDir.isDirectory) {
             _state.update { it.copy(activity = "rootfs 未导入", status = "idle") }; return@operation
         }
@@ -128,6 +180,7 @@ class PiAgentManager(
             workspace = old.workspace.copy(hasWorkspace = hasWorkspace,
                 workspaceName = workspaceManager.currentWorkspaceName, workspacePath = workspaceManager.currentWorkspacePath)) }
         if (active != null && !_state.value.turnActive && boundSession == null) readMessages(active)
+        }
     }
 
     fun createSession(name: String = "") {
@@ -137,7 +190,7 @@ class PiAgentManager(
             requireReady()
             val session = withContext(Dispatchers.IO) {
                 val cfg = configManager.readSnapshot(); val model = resolveDefaultModel(cfg)
-                repo.createSession(name, model?.provider, model?.id, cfg.defaultThinkingLevel)
+                repo.createSession(name, model?.provider, model?.id, defaultThinking(cfg), settings.agentSettings.value.autoCompaction)
             }
             _state.update { it.copy(activeSessionId = session.id, activeStats = null) }
             // A failed PI startup must not hide the session already saved on disk.
@@ -203,20 +256,21 @@ class PiAgentManager(
         operation { withContext(Dispatchers.IO) { repo.updateRuntimeStatus(target, "stopped") }; publishSessions() }
     }
 
-    /** Synchronous admission: false means the composer must retain its draft. */
-    fun sendPrompt(text: String, attachments: List<DraftAttachment> = emptyList(), sendMode: String? = null): Boolean {
+    /** True only after PI acknowledges this prompt. Cancellation never accepts a draft. */
+    suspend fun sendPrompt(text: String, attachments: List<DraftAttachment> = emptyList(), sendMode: String? = null): Boolean = managedTask {
         val queueMode = when (sendMode) { "steer" -> "steer"; "followUp", "follow_up" -> "followUp"; else -> null }
-        if (closed || submitting || (text.isBlank() && attachments.isEmpty()) || !paths.readyMarker.isFile) return false
-        if (_state.value.status == "starting" || (_state.value.turnActive && queueMode == null)) return false
+        if (submitting || (text.isBlank() && attachments.isEmpty()) || !paths.readyMarker.isFile) return@managedTask false
+        if (_state.value.status == "starting" || (_state.value.turnActive && queueMode == null)) return@managedTask false
         val queued = _state.value.turnActive
         if (!queued) turnSerial++
         submitting = true
         val epoch = generation
         _state.update { it.copy(turnActive = true, status = "working", error = null, activity = if (queued) "正在排队" else "正在发送…",
             processingPhase = if (queued) it.processingPhase else "connecting", promptSentAt = if (queued) it.promptSentAt else System.currentTimeMillis(), firstDeltaAt = if (queued) it.firstDeltaAt else 0L) }
-        operation {
-            var queuedPrompt: QueuedPrompt? = null
-            try {
+        var queuedPrompt: QueuedPrompt? = null
+        try {
+            operations.withLock {
+                ensureCurrent(epoch)
                 val id = _state.value.activeSessionId ?: withContext(Dispatchers.IO) { createDefaultSessionWithConfiguredModel().id }
                 _state.update { it.copy(activeSessionId = id) }
                 val rpc = connection(id)
@@ -233,23 +287,38 @@ class PiAgentManager(
                     if (images.none { it.data == image.data }) images += ImagePayload(data = image.data, mimeType = image.mimeType)
                 }
                 if (queued && queueMode != null) {
-                    queuedPrompt = QueuedPrompt(expanded.message, text.ifBlank { attachmentSummary(stored.map { it.display }) }, queueMode)
-                    queuedPrompts += queuedPrompt
+                    val item = QueuedPrompt(expanded.message, text.ifBlank { attachmentSummary(stored.map { it.display }) }, queueMode)
+                    queuedPrompt = item
+                    queuedPrompts += item
                     publishQueue()
                 }
                 rpc.request("prompt", buildJsonObject {
                     put("message", expanded.message)
                     if (images.isNotEmpty()) put("images", json.encodeToJsonElement(images))
                     if (queued && queueMode != null) put("streamingBehavior", queueMode)
-                })
-                if (epoch == generation) { _state.update { it.copy(activity = if (it.turnActive) "PI 已接受消息" else it.activity) }; startMonitor(epoch, id) }
-            } catch (error: PiRpcCommandException) {
+                }, timeoutMs = settings.agentSettings.value.promptTimeoutSecs.toLong() * 1000)
+                ensureCurrent(epoch, id)
+                _state.update { it.copy(activity = if (it.turnActive) "PI 已接受消息" else it.activity) }
+                startMonitor(epoch, id)
+                true
+            }
+        } catch (error: CancellationException) {
+            if (epoch == generation) {
+                if (error is TimeoutCancellationException) fail("PI prompt response timed out")
+                else { disconnect(); _state.update { it.copy(status = "stopped", activity = "发送已取消，草稿已保留") } }
+            }
+            throw error
+        } catch (error: PiRpcCommandException) {
+            if (epoch == generation) {
                 queuedPrompt?.let { queuedPrompts.remove(it); publishQueue() }
-                if (!queued) throw error
-                _state.update { it.copy(error = configManager.redact(error.message ?: "PI rejected queued message")) }
-            } finally { if (epoch == generation) submitting = false }
-        }
-        return true
+                if (queued) _state.update { it.copy(error = configManager.redact(error.message ?: "PI rejected queued message")) }
+                else fail(error.message ?: "PI rejected message")
+            }
+            false
+        } catch (error: Exception) {
+            if (epoch == generation) fail(error.message ?: "PI operation failed")
+            false
+        } finally { if (epoch == generation) submitting = false }
     }
 
     fun abort(id: String? = null) {
@@ -260,6 +329,7 @@ class PiAgentManager(
         val rpc = transport ?: return
         scope.launch {
             try { rpc.request("abort", timeoutMs = 5_000) }
+            catch (error: CancellationException) { if (error !is TimeoutCancellationException) throw error }
             catch (_: Exception) { /* Hard stop below also handles hung tools/preflight. */ }
             if (epoch == generation) {
                 disconnect()
@@ -275,14 +345,15 @@ class PiAgentManager(
     }
 
     private suspend fun readMessages(id: String) {
+        val epoch = generation
         _state.update { it.copy(messagesLoading = true) }
         try {
             val rpc = connection(id)
             val revision = messageRevision
             val data = rpc.request("get_messages")
-            if (!_state.value.turnActive && messageRevision == revision && _state.value.activeSessionId == id)
+            if (epoch == generation && !_state.value.turnActive && messageRevision == revision && _state.value.activeSessionId == id)
                 _state.update { it.copy(messages = normalizePiMessages((data["messages"] as? JsonArray).orEmpty())) }
-        } finally { _state.update { it.copy(messagesLoading = false) } }
+        } finally { if (epoch == generation && _state.value.activeSessionId == id) _state.update { it.copy(messagesLoading = false) } }
     }
 
     fun clearRawLog() {
@@ -293,10 +364,10 @@ class PiAgentManager(
 
     /** Select the same container directory used by PI, sessions and attachments. */
     fun setWorkspace(path: String, create: Boolean = false, onResult: (Boolean, String) -> Unit = { _, _ -> }) {
-        workspaceScope.launch {
+        workspaceTasks.launch {
             try {
                 val selected = operations.withLock {
-                    check(!closed) { "Agent 已关闭" }
+                    check(!closed && !environmentStopped) { "Agent 环境已停止，请刷新后重试" }
                     check(!_state.value.turnActive && _state.value.status != "starting") { "请先停止当前任务再切换工作区" }
                     val previous = workspaceProotPath
                     val next = workspaceManager.setWorkspace(path, create)
@@ -332,7 +403,8 @@ class PiAgentManager(
         workspaceListing?.cancel()
         val revision = ++workspaceListingRevision
         val root = workspaceProotPath
-        workspaceListing = workspaceScope.launch {
+        if (closed || environmentStopped) return
+        workspaceListing = workspaceTasks.launch {
             _state.update { it.copy(workspace = it.workspace.copy(loading = true, error = null)) }
             try {
                 val files = workspaceManager.listFiles(path)
@@ -356,8 +428,9 @@ class PiAgentManager(
     }
 
     /** 读取工作区文件作为草稿附件（用于发送给 Agent）。 */
-    suspend fun readWorkspaceFileAsAttachment(entry: WorkspaceFileEntry): DraftAttachment =
+    suspend fun readWorkspaceFileAsAttachment(entry: WorkspaceFileEntry): DraftAttachment = managedTask {
         workspaceManager.readAsDraftAttachment(entry)
+    }
 
     /** 将指定助手回复保存为工作区文件（满足"生成的代码文件都放工作区"）。 */
     fun saveAssistantMessageToWorkspace(messageId: String, fileName: String, onResult: (Boolean, String) -> Unit = { _, _ -> }) {
@@ -373,6 +446,7 @@ class PiAgentManager(
         }
         val safeName = safeFileName(fileName).ifBlank { "reply.txt" }
         val finalName = if (safeName.contains('.')) safeName else "$safeName.txt"
+        if (closed || environmentStopped) return
         scope.launch {
             runCatchingSuspend {
                 withContext(Dispatchers.IO) { workspaceManager.writeFileText(finalName, content) }
@@ -393,18 +467,19 @@ class PiAgentManager(
     }
 
     /** 将工作区文件内容作为文本引用插入到输入框。 */
-    suspend fun readWorkspaceFileAsText(entry: WorkspaceFileEntry): String = workspaceManager.readAsText(entry)
+    suspend fun readWorkspaceFileAsText(entry: WorkspaceFileEntry): String = managedTask { workspaceManager.readAsText(entry) }
 
-    suspend fun readDraftAttachment(uri: android.net.Uri): DraftAttachment = attachmentManager.readDraft(uri)
+    suspend fun readDraftAttachment(uri: android.net.Uri): DraftAttachment = managedTask { attachmentManager.readDraft(uri) }
 
     fun loadSessionModels(force: Boolean = false) = operation {
         if (!force && _state.value.sessionModels.isNotEmpty()) return@operation
         val id = _state.value.activeSessionId ?: return@operation
+        val epoch = generation
         _state.update { it.copy(modelLoading = true) }
         try {
             val data = connection(id).request("get_available_models")
             _state.update { it.copy(sessionModels = (data["models"] as? JsonArray).orEmpty().map { model -> json.decodeFromJsonElement<PiModel>(model) }) }
-        } finally { _state.update { it.copy(modelLoading = false) } }
+        } finally { if (epoch == generation && _state.value.activeSessionId == id) _state.update { it.copy(modelLoading = false) } }
     }
 
     fun setSessionModel(model: PiModel) = operation {
@@ -498,6 +573,7 @@ class PiAgentManager(
         val id = _state.value.activeSessionId ?: return@operation
         try {
             connection(id).request("clear_queue")
+            queuedPrompts.clear()
             _state.update { it.copy(activeQueue = QueueState()) }
         } catch (_: PiRpcCommandException) {
             _state.update { it.copy(activity = "此 PI 版本不支持清空队列，请停止本轮以取消排队消息") }
@@ -520,7 +596,7 @@ class PiAgentManager(
         }
         disconnect()
         val epoch = generation
-        return operations.withLock {
+        return managedTask { operations.withLock {
             try {
                 check(!closed && epoch == generation) { "工作区或会话已切换，请重新打开配置" }
                 val saved = withContext(Dispatchers.IO) {
@@ -543,6 +619,7 @@ class PiAgentManager(
                 false
             }
         }
+        }
     }
 
     // ==================== Deep Index Mode ====================
@@ -559,7 +636,7 @@ class PiAgentManager(
 
     fun isDeepIndexEnabled(): Boolean = deepIndexToolChain.isEnabled()
 
-    suspend fun listFiles(path: String): List<FileEntry> = withContext(Dispatchers.IO) {
+    suspend fun listFiles(path: String): List<FileEntry> = managedIO {
         val dir = workspaceFile(path)
         require(dir.isDirectory) { "目录不存在：${workspaceAbsPath(path)}" }
         dir.listFiles().orEmpty().map { file ->
@@ -573,14 +650,14 @@ class PiAgentManager(
         }
     }
 
-    suspend fun uploadFile(path: String, draft: DraftAttachment): FileEntry = withContext(Dispatchers.IO) {
+    suspend fun uploadFile(path: String, draft: DraftAttachment): FileEntry = managedIO {
         val dir = workspaceFile(path).apply { mkdirs() }
         val target = uniqueFile(dir, draft.name)
         target.writeBytes(draft.bytes)
         FileEntry(target.name, workspaceRelPath(target), "file", target.length(), Instant.ofEpochMilli(target.lastModified()).toString())
     }
 
-    suspend fun importInstalledApk(packageName: String, label: String, apkPath: String, destinationPath: String = "."): FileEntry = withContext(Dispatchers.IO) {
+    suspend fun importInstalledApk(packageName: String, label: String, apkPath: String, destinationPath: String = "."): FileEntry = managedIO {
         val source = File(apkPath)
         require(source.isFile && source.canRead()) { "无法读取 APK：$apkPath" }
         val dir = workspaceFile(destinationPath).apply { mkdirs() }
@@ -589,29 +666,29 @@ class PiAgentManager(
         FileEntry(target.name, workspaceRelPath(target), "file", target.length(), Instant.ofEpochMilli(target.lastModified()).toString())
     }
 
-    suspend fun mkdir(path: String) = withContext(Dispatchers.IO) {
+    suspend fun mkdir(path: String) = managedIO {
         workspaceFile(path).mkdirs()
     }
 
-    suspend fun deleteFile(path: String) = withContext(Dispatchers.IO) {
+    suspend fun deleteFile(path: String) = managedIO {
         val file = workspaceFile(path)
         if (file.isDirectory) file.deleteRecursively() else file.delete()
     }
 
-    suspend fun fileForSharing(path: String): File = withContext(Dispatchers.IO) {
+    suspend fun fileForSharing(path: String): File = managedIO {
         val file = workspaceFile(path)
         require(file.isFile) { "文件不存在：${workspaceAbsPath(path)}" }
         file
     }
 
-    suspend fun saveFileAs(path: String, destination: Uri) = withContext(Dispatchers.IO) {
+    suspend fun saveFileAs(path: String, destination: Uri) = managedIO {
         val file = workspaceFile(path)
         require(file.isFile) { "文件不存在：${workspaceAbsPath(path)}" }
         val output = appContext.contentResolver.openOutputStream(destination, "wt") ?: error("无法写入目标文件")
         output.use { target -> file.inputStream().use { source -> source.copyTo(target) } }
     }
 
-    suspend fun readFileText(path: String, maxBytes: Long = 512L * 1024L): String = withContext(Dispatchers.IO) {
+    suspend fun readFileText(path: String, maxBytes: Long = 512L * 1024L): String = managedIO {
         val file = workspaceFile(path)
         require(file.isFile) { "文件不存在：${workspaceAbsPath(path)}" }
         require(file.length() <= maxBytes) { "文件过大：${file.length() / 1024} KiB，仅支持预览 ${maxBytes / 1024} KiB 内文本" }
@@ -632,9 +709,13 @@ class PiAgentManager(
         return repo.ensureDefaultSession(
             provider = snapshot.defaultProvider.trim().takeIf { it.isNotBlank() } ?: defaultPair?.provider,
             model = snapshot.defaultModel.trim().takeIf { it.isNotBlank() } ?: defaultPair?.id,
-            thinkingLevel = snapshot.defaultThinkingLevel.trim().takeIf { it.isNotBlank() }
+            thinkingLevel = defaultThinking(snapshot),
+            autoCompactionEnabled = settings.agentSettings.value.autoCompaction
         )
     }
+
+    private fun defaultThinking(snapshot: PiConfigSnapshot): String = resolveAgentDefaultThinking(
+        settings.explicitAgentDefaultThinking(), snapshot.defaultThinkingLevel)
 
     private suspend fun connection(id: String): PiRpcTransport {
         transport?.takeIf { boundSession == id }?.let { return it }
@@ -667,24 +748,37 @@ class PiAgentManager(
         var launched: Process? = null
         val process = try {
             withContext(Dispatchers.IO) { ProcessBuilder(spec.command).directory(spec.workingDirectory).apply { environment().putAll(spec.environment) }.start().also { launched = it } }
-        } catch (e: CancellationException) { launched?.destroyForcibly(); throw e }
-        if (epoch != generation) { process.destroyForcibly(); throw CancellationException("Session changed") }
+        } catch (e: CancellationException) {
+            withContext(NonCancellable + Dispatchers.IO) { launched?.let { it.destroyForcibly(); it.waitFor() } }
+            throw e
+        }
+        if (epoch != generation) {
+            withContext(NonCancellable + Dispatchers.IO) { process.destroyForcibly(); process.waitFor() }
+            throw CancellationException("Session changed")
+        }
         val rpc = PiRpcTransport(process,
             onEvent = { event -> scope.launch {
                 if (epoch == generation) try { handleEvent(epoch, id, event) }
+                catch (e: CancellationException) { throw e }
                 catch (e: Exception) { if (epoch == generation) fail(e.message ?: "PI event failed") }
             } },
             onFailure = { error -> scope.launch { if (epoch == generation) fail(error.message ?: "PI exited") } },
             onStderr = { scope.launch { if (epoch == generation) _state.update { it.copy(stderrTail = "PI emitted diagnostic stderr. Raw output is hidden to protect credentials; command errors appear above.") } } })
         transport = rpc; boundSession = id
-        val runtimeState = rpc.request("get_state")
-        session.autoCompactionEnabled?.let { rpc.request("set_auto_compaction", buildJsonObject { put("enabled", it) }) }
+        ensureCurrent(epoch, id)
+        val defaults = session.withAgentDefaults(
+            defaultThinking(withContext(Dispatchers.IO) { configManager.readSnapshot() }), settings.agentSettings.value.autoCompaction)
+        rpc.request("set_thinking_level", fields("level" to defaults.thinkingLevel!!))
+        rpc.request("set_auto_compaction", buildJsonObject { put("enabled", defaults.autoCompactionEnabled!!) })
         if (session.name.isNotBlank()) rpc.request("set_session_name", fields("name" to session.name))
-        persistRuntimeState(id, runtimeState)
+        persistRuntimeState(id, rpc.request("get_state"))
         if (_state.value.turnActive) {
+            val revision = messageRevision
             val history = rpc.request("get_messages")
-            _state.update { it.copy(messages = normalizePiMessages((history["messages"] as? JsonArray).orEmpty())) }
+            ensureCurrent(epoch, id)
+            if (revision == messageRevision) _state.update { it.copy(messages = normalizePiMessages((history["messages"] as? JsonArray).orEmpty())) }
         }
+        ensureCurrent(epoch, id)
         _state.update { it.copy(status = if (it.turnActive) "working" else "running", activity = if (it.turnActive) "正在发送…" else "PI 已就绪", error = null) }
         return rpc
     }
@@ -715,6 +809,7 @@ class PiAgentManager(
                 // Probe responsiveness, never impose an arbitrary maximum duration on valid tools.
                 while (epoch == generation && _state.value.turnActive) {
                     delay(1500)
+                    ensureCurrent(epoch, id)
                     val rpc = transport ?: break
                     val data = rpc.request("get_state", timeoutMs = 15_000)
                     if (epoch != generation) break
@@ -722,7 +817,10 @@ class PiAgentManager(
                         finishTurn(id); break
                     }
                 }
-            } catch (e: CancellationException) { if (epoch == generation && e is TimeoutCancellationException) fail("PI became unresponsive") }
+            } catch (e: CancellationException) {
+                if (epoch == generation && e is TimeoutCancellationException) fail("PI became unresponsive")
+                else throw e
+            }
             catch (e: Exception) { if (epoch == generation) fail(e.message ?: "PI became unavailable") }
         }
     }
@@ -730,7 +828,7 @@ class PiAgentManager(
     private fun finishTurn(id: String) {
         val nextQueue = QueueState(queuedPrompts.filter { it.mode == "steer" }.map { it.displayText }, queuedPrompts.filter { it.mode == "followUp" }.map { it.displayText })
         _state.update { it.copy(turnActive = nextQueue.steering.isNotEmpty() || nextQueue.followUp.isNotEmpty(), processingPhase = null, status = if (it.error == null) "running" else "error", activity = if (it.error == null) "已完成" else "本轮失败", activeQueue = nextQueue) }
-        streamingId = null
+        streamingId = null; streamingMessages.clear()
         operation {
             if (_state.value.activeSessionId == id && !_state.value.turnActive) {
                 readMessages(id)
@@ -743,7 +841,7 @@ class PiAgentManager(
     }
 
     private suspend fun handleEvent(epoch: Long, id: String, event: JsonObject) {
-        if (id != _state.value.activeSessionId) return
+        ensureCurrent(epoch, id)
         when (event.string("type")) {
             "agent_start" -> { _state.update { it.copy(turnActive = true, status = "working", processingPhase = "receiving") }; startMonitor(epoch, id) }
             "agent_end" -> startMonitor(epoch, id)
@@ -756,10 +854,15 @@ class PiAgentManager(
                     val index = queuedPrompts.indexOfFirst { it.wireText == contentToText(message["content"]) }
                     if (index >= 0) { queuedPrompts.removeAt(index); publishQueue() }
                 }
-                streamingBase = _state.value.messages
-                streamingId = newMessageId()
-                if (message.string("role") == "assistant") appendMessage(ChatMessage(streamingId!!, "assistant", "", System.currentTimeMillis()))
-                else _state.update { it.copy(messages = streamingBase + normalizePiMessages(listOf(message))) }
+                val role = message.string("role")!!
+                val placeholderId = newMessageId()
+                streamingMessages[role] = placeholderId
+                if (role == "assistant") {
+                    streamingId = placeholderId
+                    appendMessage(ChatMessage(placeholderId, role, "", System.currentTimeMillis()))
+                } else {
+                    normalizePiMessages(listOf(message)).firstOrNull()?.let { appendMessage(it.copy(id = placeholderId)) }
+                }
             }
             "message_update" -> {
                 messageRevision++
@@ -776,8 +879,11 @@ class PiAgentManager(
             "message_end" -> {
                 val message = event["message"] as? JsonObject ?: return
                 messageRevision++
-                if (message.string("role") in setOf("assistant", "user")) {
-                    _state.update { it.copy(messages = streamingBase + normalizePiMessages(listOf(message)).mapIndexed { index, item -> item.copy(id = "${streamingId ?: newMessageId()}-$index") }) }
+                val role = message.string("role")
+                if (role in setOf("assistant", "user")) {
+                    val placeholderId = streamingMessages.remove(role) ?: newMessageId()
+                    _state.update { it.copy(messages = mergeCompletedPiMessage(it.messages, placeholderId, normalizePiMessages(listOf(message)))) }
+                    if (streamingId == placeholderId) streamingId = null
                 }
                 if (message.string("role") == "assistant" && message.string("stopReason") == "error") {
                     val error = configManager.redact(message.string("errorMessage") ?: "PI provider request failed")
@@ -804,7 +910,9 @@ class PiAgentManager(
             "queue_update" -> _state.update { it.copy(activeQueue = QueueState(event.strings("steering"), event.strings("followUp"))) }
             "extension_ui_request" -> {
                 if (event.string("method") in setOf("select", "confirm", "input", "editor")) {
-                    transport?.cancelExtensionDialog(event.string("id") ?: return)
+                    val rpc = transport?.takeIf { boundSession == id } ?: return
+                    rpc.cancelExtensionDialog(event.string("id") ?: return)
+                    ensureCurrent(epoch, id)
                     _state.update { it.copy(activity = "扩展交互已取消：此界面不支持扩展对话框") }
                 } else event.string("message")?.let { message -> _state.update { it.copy(activity = configManager.redact(message)) } }
             }

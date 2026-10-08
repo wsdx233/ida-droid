@@ -17,7 +17,10 @@ import java.io.FilterInputStream
 import java.io.InputStream
 import java.nio.file.Files
 import java.time.Instant
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
@@ -175,6 +178,17 @@ class RootfsImporter(
                 stagingEnv = null
 
                 report(ImportStage.Done, 1.0f, "rootfs 导入完成，环境已 ready")
+            } catch (cancelled: CancellationException) {
+                // 取消不是导入失败：不保留调试容器，也不向 Flow 发出 Error。
+                stagingLog = null
+                try {
+                    stagingEnv?.let { staging ->
+                        check(staging.deleteRecursively()) { "无法清理已取消导入的 staging：${staging.absolutePath}" }
+                    }
+                } catch (cleanupFailure: Exception) {
+                    cancelled.addSuppressed(cleanupFailure)
+                }
+                throw cancelled
             } catch (t: Throwable) {
                 stagingLog = null
                 val reason = t.message ?: t::class.java.simpleName
@@ -232,6 +246,7 @@ class RootfsImporter(
                 var lastReportBytes = 0L
                 var entry: TarArchiveEntry?
                 while (tarInput.nextEntry.also { entry = it } != null) {
+                    currentCoroutineContext().ensureActive()
                     val currentEntry = entry ?: continue
                     val normalizedName = normalizeEntryName(currentEntry.name) ?: continue
                     entryCount += 1
@@ -320,12 +335,13 @@ class RootfsImporter(
         Os.symlink(symlinkTarget, linkFile.absolutePath)
     }
 
-    private fun handleRegularFile(tarInput: TarArchiveInputStream, outputFile: File) {
+    private suspend fun handleRegularFile(tarInput: TarArchiveInputStream, outputFile: File) {
         if (outputFile.exists() && outputFile.isDirectory) outputFile.deleteRecursively()
         outputFile.parentFile?.mkdirs()
         BufferedOutputStream(FileOutputStream(outputFile)).use { output ->
             val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
             while (true) {
+                currentCoroutineContext().ensureActive()
                 val read = tarInput.read(buffer)
                 if (read == -1) break
                 output.write(buffer, 0, read)

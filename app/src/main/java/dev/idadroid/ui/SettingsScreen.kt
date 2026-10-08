@@ -665,9 +665,11 @@ fun SettingsScreen(
             onDismiss = { editMcpSessionKa = false },
             onSave = { value ->
                 val secs = value.toIntOrNull()
-                if (secs != null) {
+                if (secs != null && secs in 0..86_400) {
                     settingsStore.updateMcpSessionKeepAlive(secs)
                     editMcpSessionKa = false
+                } else {
+                    Toast.makeText(context, "Session 保活必须在 0-86400 秒", Toast.LENGTH_SHORT).show()
                 }
             }
         )
@@ -679,9 +681,11 @@ fun SettingsScreen(
             onDismiss = { editMcpSseKa = false },
             onSave = { value ->
                 val secs = value.toIntOrNull()
-                if (secs != null) {
+                if (secs != null && secs in 0..300) {
                     settingsStore.updateMcpSseKeepAlive(secs)
                     editMcpSseKa = false
+                } else {
+                    Toast.makeText(context, "SSE 保活必须在 0-300 秒", Toast.LENGTH_SHORT).show()
                 }
             }
         )

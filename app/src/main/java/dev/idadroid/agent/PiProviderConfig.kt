@@ -18,7 +18,7 @@ internal fun parsePiModels(text: String, validateValues: Boolean = true): JsonOb
         val base = (provider["baseUrl"] ?: provider["baseURL"])?.jsonPrimitive?.content.orEmpty()
         if (validateValues && base.isNotBlank()) {
             val uri = runCatching { java.net.URI(base) }.getOrNull()
-            require(uri != null && uri.scheme in listOf("https", "http") && !uri.host.isNullOrBlank() && uri.rawQuery == null && uri.rawFragment == null && uri.userInfo == null) { "Base URL must be an HTTP(S) base URL without credentials, query or fragment" }
+            require(uri != null && (uri.scheme.equals("https", ignoreCase = true) || uri.scheme.equals("http", ignoreCase = true)) && !uri.host.isNullOrBlank() && uri.rawQuery == null && uri.rawFragment == null && uri.userInfo == null) { "Base URL must be an HTTP(S) base URL without credentials, query or fragment" }
         }
         provider["compat"]?.let { require(it is JsonObject) { "compat must be an object" } }
         provider["headers"]?.let { headers ->

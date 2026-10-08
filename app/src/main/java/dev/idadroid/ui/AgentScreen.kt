@@ -85,9 +85,13 @@ fun AgentScreen(
             if (latestSessionId != id) {
                 feedback = "Session 已切换，消息仍保留在原会话草稿中。"
             } else if (manager.sendPrompt(submitted.text, payload, mode)) {
-                store.clearAccepted(id, submitted)
-                followLatest = true
-                feedback = null
+                // sendPrompt suspends until the ACK, not merely until work is enqueued.
+                // A session switch between ACK and this continuation must retain the draft.
+                if (latestSessionId == id && manager.state.value.activeSessionId == id) {
+                    store.clearAccepted(id, submitted)
+                    followLatest = true
+                    feedback = null
+                } else feedback = "Session 已切换，消息仍保留在原会话草稿中。"
             } else feedback = "消息未被接收。草稿已保留，请检查模型与当前任务状态。"
         } catch (error: CancellationException) {
             throw error

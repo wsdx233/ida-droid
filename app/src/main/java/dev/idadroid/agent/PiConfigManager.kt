@@ -24,64 +24,64 @@ class PiConfigManager(
     private val workspace get() = containerFiles.rootfsFile(workspaceProotPath())
     private val idaDroidDir get() = File(workspace, ".idadroid")
     private val agentDir get() = File(idaDroidDir, "pi-agent")
-    private val piDir get() = File(workspace, ".pi")
-    private val configFile get() = File(agentDir, "idadroid-pi-config.json")
-    private val settingsFile get() = File(agentDir, "settings.json")
-    private val modelsFile get() = File(agentDir, "models.json")
-    private val appendSystemFile get() = File(piDir, "APPEND_SYSTEM.md")
-    private val runtimeProotPath get() = "/root/.idadroid/pi-runtime/" + java.util.UUID.nameUUIDFromBytes(workspaceProotPath().toByteArray(Charsets.UTF_8))
+    private val runtimeProotPath get() = runtimeProotPath(workspaceProotPath())
     private val runtimeHostDir get() = File(paths.rootfsDir, runtimeProotPath.removePrefix("/"))
+    private fun runtimeProotPath(workspacePath: String): String = "/root/.idadroid/pi-runtime/" + java.util.UUID.nameUUIDFromBytes(workspacePath.toByteArray(Charsets.UTF_8))
 
     private val lenientJson = Json { ignoreUnknownKeys = true; explicitNulls = false; prettyPrint = true }
 
-    @Volatile private var cachedSnapshot: PiConfigSnapshot? = null
-    @Volatile private var cachedSnapshotTime: Long = 0
+    private var cachedSnapshot: PiConfigSnapshot? = null
+    private var cachedFileStates: List<PiConfigPersistence.FileState>? = null
 
-    fun readUserConfig(): PiUserConfig {
-        if (!configFile.isFile) return PiUserConfig()
-        return try { lenientJson.decodeFromString<PiUserConfig>(configFile.readText()) }
+    private fun <T> withConfiguration(block: (PiConfigPersistence, String) -> T): T {
+        val workspacePath = workspaceProotPath()
+        val persistence = PiConfigPersistence(containerFiles.rootfsFile(workspacePath), File(paths.filesDir, ".pi-config-lock"))
+        return persistence.locked { block(persistence, workspacePath) }
+    }
+
+    fun readUserConfig(): PiUserConfig = withConfiguration { persistence, _ ->
+        readUserConfig(persistence.files[0])
+    }
+
+    private fun readUserConfig(file: File): PiUserConfig {
+        if (!file.isFile) return PiUserConfig()
+        return try { lenientJson.decodeFromString<PiUserConfig>(file.readText()) }
         catch (_: Exception) { error("Invalid IDAdroid PI configuration; original preserved") }
     }
 
-    fun readSnapshot(): PiConfigSnapshot {
-        // 缓存：如果配置文件未修改，直接返回缓存
-        val configLastModified = maxOf(
-            configFile.lastModified(),
-            modelsFile.lastModified(),
-            settingsFile.lastModified(),
-            appendSystemFile.lastModified()
-        )
-        cachedSnapshot?.let { cache ->
-            if (cache.materializedDir == runtimeProotPath && cachedSnapshotTime == configLastModified) {
-                return cache
-            }
-        }
+    fun readSnapshot(): PiConfigSnapshot = withConfiguration { persistence, workspacePath ->
+        readSnapshot(persistence, workspacePath)
+    }
 
-        val cfg = readUserConfig()
+    private fun readSnapshot(persistence: PiConfigPersistence, workspacePath: String): PiConfigSnapshot {
+        val fileStates = persistence.fileStates()
+        val runtimePath = runtimeProotPath(workspacePath)
+        cachedSnapshot?.let { cache ->
+            if (cache.materializedDir == runtimePath && cachedFileStates == fileStates) return cache
+        }
+        val (configFile, settingsFile, modelsFile, appendFile) = persistence.files
+        val cfg = readUserConfig(configFile)
         val modelsText = modelsFile.readTextOrDefault("{}\n")
         val snapshot = PiConfigSnapshot(
             defaultProvider = cfg.defaultProvider.orEmpty(),
             defaultModel = cfg.defaultModel.orEmpty(),
             defaultThinkingLevel = cfg.defaultThinkingLevel ?: "medium",
             enabledModels = cfg.enabledModels.joinToString(", "),
-            settingsText = settingsFile.readTextOrDefault(defaultSettingsText()),
+            settingsText = settingsFile.readTextOrDefault(defaultSettingsText(workspacePath)),
             modelsText = modelsText,
             envText = JsonFormats.pretty.encodeToString(cfg.env),
-            appendSystem = appendSystemFile.readTextOrDefault(defaultAppendSystemPrompt()),
+            appendSystem = appendFile.readTextOrDefault(defaultSystemAppendPrompt(workspacePath)),
             extraArgsText = cfg.extraArgs.joinToString("\n"),
-            materializedDir = runtimeProotPath,
+            materializedDir = runtimePath,
             modelCatalog = parseAgentModelCatalog(modelsText)
         )
         cachedSnapshot = snapshot
-        cachedSnapshotTime = configLastModified
+        cachedFileStates = fileStates
         return snapshot
     }
 
-    fun saveSnapshot(snapshot: PiConfigSnapshot) {
-        // Capture destinations once, and validate every payload before touching originals.
-        val targetWorkspace = workspace
-        val targetAgentDir = File(targetWorkspace, ".idadroid/pi-agent")
-        val targetPiDir = File(targetWorkspace, ".pi")
+    fun saveSnapshot(snapshot: PiConfigSnapshot) = withConfiguration { persistence, _ ->
+        // Validate and serialize every payload before touching originals.
         parseObject(snapshot.settingsText.ifBlank { "{}" })
         val models = prepareModels(snapshot.modelsText, snapshot.defaultProvider.trim(), snapshot.defaultModel.trim())
         val env = parseEnv(snapshot.envText)
@@ -95,14 +95,17 @@ class PiConfigManager(
         )
         validateRuntimeConfig(config)
         runtimeModels(models, config) // Conversion must succeed before committing editable originals.
-        check(targetAgentDir.isDirectory || targetAgentDir.mkdirs()) { "Cannot create PI config directory" }
-        check(targetPiDir.isDirectory || targetPiDir.mkdirs()) { "Cannot create PI prompt directory" }
-        privateWrite(File(targetAgentDir, "idadroid-pi-config.json"), JsonFormats.pretty.encodeToString(config))
-        privateWrite(File(targetAgentDir, "settings.json"), snapshot.settingsText.ifBlank { "{}" }.trimEnd())
-        privateWrite(File(targetAgentDir, "models.json"), JsonFormats.pretty.encodeToString(models))
-        privateWrite(File(targetPiDir, "APPEND_SYSTEM.md"), snapshot.appendSystem.trimEnd())
-        // 使缓存失效
-        cachedSnapshot = null
+        val texts = listOf(
+            JsonFormats.pretty.encodeToString(config),
+            snapshot.settingsText.ifBlank { "{}" }.trimEnd(),
+            JsonFormats.pretty.encodeToString(models),
+            snapshot.appendSystem.trimEnd()
+        )
+        try { persistence.save(texts) }
+        finally {
+            cachedSnapshot = null
+            cachedFileStates = null
+        }
     }
 
     fun defaultProvider(): String? = readUserConfig().defaultProvider?.takeIf { it.isNotBlank() }
@@ -110,12 +113,13 @@ class PiConfigManager(
     fun defaultThinking(): String? = readUserConfig().defaultThinkingLevel?.takeIf { it.isNotBlank() }
 
     /** Runtime files are separate from editable user originals. Never replace auth.json. */
-    fun materialize(): String {
-        val snapshot = readSnapshot()
-        val cfg = readUserConfig()
+    fun materialize(): String = withConfiguration { persistence, workspacePath ->
+        val snapshot = readSnapshot(persistence, workspacePath)
+        val cfg = readUserConfig(persistence.files[0])
         validateRuntimeConfig(cfg)
         val models = runtimeModels(prepareModels(snapshot.modelsText, cfg.defaultProvider.orEmpty(), cfg.defaultModel.orEmpty()), cfg)
-        val runtimeDir = runtimeHostDir.apply { mkdirs() }
+        val runtimePath = runtimeProotPath(workspacePath)
+        val runtimeDir = File(paths.rootfsDir, runtimePath.removePrefix("/")).apply { mkdirs() }
         privateWrite(File(runtimeDir, "models.json"), models.toString())
         val runtimeSettings = parseObject(snapshot.settingsText).toMutableMap().apply {
             remove("sessionDir") // Session location belongs to --session-dir, not settings.json.
@@ -125,7 +129,7 @@ class PiConfigManager(
         }
         privateWrite(File(runtimeDir, "settings.json"), JsonObject(runtimeSettings).toString())
         listOf("auth.json", "extensions", "skills", "prompts", "themes", "AGENTS.md", "SYSTEM.md").forEach { name ->
-            val original = File(agentDir, name).takeIf { it.exists() }
+            val original = File(persistence.files[0].parentFile, name).takeIf { it.exists() }
                 ?: File(paths.rootfsDir, "root/.pi/agent/$name").takeIf { it.exists() }
             if (original != null) {
                 val link = File(runtimeDir, name).toPath()
@@ -136,9 +140,10 @@ class PiConfigManager(
                 }
             }
         }
-        piDir.mkdirs()
-        if (!appendSystemFile.exists()) appendSystemFile.writeText(snapshot.appendSystem)
-        return runtimeProotPath
+        val appendFile = persistence.files[3]
+        appendFile.parentFile!!.mkdirs()
+        if (!appendFile.exists()) appendFile.writeText(snapshot.appendSystem)
+        runtimePath
     }
 
     fun runtimeEnvExports(): String = readUserConfig().env.entries.joinToString("\n") { (key, value) ->
@@ -229,11 +234,11 @@ class PiConfigManager(
 
     private fun File.readTextOrDefault(default: String): String = if (isFile) readText() else default
 
-    private fun defaultSettingsText(): String = """
+    private fun defaultSettingsText(workspacePath: String): String = """
         {
           "quietStartup": true,
           "enableInstallTelemetry": false,
-          "sessionDir": "${workspaceProotPath()}/.pi-sessions",
+          "sessionDir": "$workspacePath/.pi-sessions",
           "compaction": {
             "enabled": true,
             "reserveTokens": 16384,
@@ -250,9 +255,6 @@ class PiConfigManager(
         }
     """.trimIndent() + "\n"
 
-    private fun defaultAppendSystemPrompt(): String = defaultSystemAppendPrompt(
-        workspacePath = settings.envSettings.value.workspacePath.ifBlank { "/root/pi_workspace" }
-    )
 }
 
 /** Single source of truth for the default APPEND_SYSTEM.md content. */

@@ -12,7 +12,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.flow.onCompletion
-import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.withContext
 
 class EnvironmentManager(context: Context) {
@@ -32,9 +31,7 @@ class EnvironmentManager(context: Context) {
     }
 
     fun importRootfs(uri: Uri): Flow<ImportProgress> = importer.importFromUri(uri)
-        .onEach { progress ->
-            if (progress.stage == ImportStage.Done || progress.stage == ImportStage.Error) refresh()
-        }
+        // 包括取消在内，每次导入只在结束时重新读取一次环境状态。
         .onCompletion { refresh() }
 
     suspend fun revalidate(): ValidationReport = withContext(Dispatchers.IO) {
@@ -49,8 +46,11 @@ class EnvironmentManager(context: Context) {
     }
 
     suspend fun deleteEnvironment() = withContext(Dispatchers.IO) {
-        paths.envDir.deleteRecursively()
-        refresh()
+        try {
+            check(paths.envDir.deleteRecursively()) { "无法完整删除 active 环境，请重试" }
+        } finally {
+            refresh()
+        }
     }
 
     private fun loadState(): EnvironmentState {

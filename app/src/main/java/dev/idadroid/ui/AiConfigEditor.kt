@@ -262,6 +262,7 @@ fun AiConfigEditor(
                     onValueChange = { updateProvider(snapshot, parsed, currentProvider.copy(baseUrl = it), onSnapshotChange) },
                     enabled = parsed.parseError == null,
                     label = { Text("Base URL") },
+                    placeholder = { Text("http:// 或 https://...") },
                     leadingIcon = { Icon(Icons.Rounded.Public, contentDescription = null) },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),

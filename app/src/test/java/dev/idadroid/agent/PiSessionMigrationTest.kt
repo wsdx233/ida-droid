@@ -48,4 +48,17 @@ class PiSessionMigrationTest {
             assertFalse(destination.exists())
         } finally { directory.deleteRecursively() }
     }
+
+    @Test fun unsupportedStructuredContentIsNotSilentlyConvertedToEmptyText() {
+        val directory = Files.createTempDirectory("pi-migration-content").toFile()
+        try {
+            val source = File(directory, "native.jsonl")
+            val original = """{"role":"user","content":[{"type":"text","text":"keep this evidence"}]}""" + "\n"
+            source.writeText(original)
+            val destination = File(directory, "pi.jsonl")
+            assertTrue(runCatching { PiSessionMigration.migrate(source, destination, "/root/work", null, null) }.isFailure)
+            assertEquals(original, source.readText())
+            assertFalse(destination.exists())
+        } finally { directory.deleteRecursively() }
+    }
 }

@@ -64,14 +64,15 @@ class AgentSessionRepository(
 
     fun activeSessionId(): String? = loadStore().activeSessionId
 
-    fun ensureDefaultSession(provider: String? = null, model: String? = null, thinkingLevel: String? = null): AgentSessionRecord = synchronized(lock) {
+    fun ensureDefaultSession(provider: String? = null, model: String? = null, thinkingLevel: String? = null, autoCompactionEnabled: Boolean? = null): AgentSessionRecord = synchronized(lock) {
         val store = loadStoreInternal()
         val existing = store.sessions.firstOrNull { it.id == store.activeSessionId } ?: store.sessions.firstOrNull()
         if (existing != null) {
             val patched = existing.copy(
                 provider = existing.provider ?: provider?.trim()?.takeIf { it.isNotBlank() },
                 model = existing.model ?: model?.trim()?.takeIf { it.isNotBlank() },
-                thinkingLevel = existing.thinkingLevel ?: thinkingLevel?.trim()?.takeIf { it.isNotBlank() }
+                thinkingLevel = existing.thinkingLevel?.trim()?.takeIf { it.isNotBlank() } ?: thinkingLevel?.trim()?.takeIf { it.isNotBlank() },
+                autoCompactionEnabled = existing.autoCompactionEnabled ?: autoCompactionEnabled
             )
             val nextSessions = if (patched == existing) store.sessions else store.sessions.map { if (it.id == existing.id) patched else it }
             if (store.activeSessionId == existing.id && patched == existing) return@synchronized existing
@@ -87,6 +88,7 @@ class AgentSessionRepository(
             provider = provider?.trim()?.takeIf { it.isNotBlank() },
             model = model?.trim()?.takeIf { it.isNotBlank() },
             thinkingLevel = thinkingLevel?.trim()?.takeIf { it.isNotBlank() },
+            autoCompactionEnabled = autoCompactionEnabled,
             createdAt = now,
             updatedAt = now
         )
@@ -94,7 +96,7 @@ class AgentSessionRepository(
         session
     }
 
-    fun createSession(name: String? = null, provider: String? = null, model: String? = null, thinkingLevel: String? = null): AgentSessionRecord = synchronized(lock) {
+    fun createSession(name: String? = null, provider: String? = null, model: String? = null, thinkingLevel: String? = null, autoCompactionEnabled: Boolean? = null): AgentSessionRecord = synchronized(lock) {
         val store = loadStoreInternal()
         val now = Instant.now().toString()
         val session = AgentSessionRecord(
@@ -105,6 +107,7 @@ class AgentSessionRepository(
             provider = provider?.trim()?.takeIf { it.isNotBlank() },
             model = model?.trim()?.takeIf { it.isNotBlank() },
             thinkingLevel = thinkingLevel?.trim()?.takeIf { it.isNotBlank() },
+            autoCompactionEnabled = autoCompactionEnabled,
             createdAt = now,
             updatedAt = now
         )

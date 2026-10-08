@@ -6,6 +6,8 @@ import android.util.Log
 import dev.idadroid.env.EnvironmentPaths
 import dev.idadroid.proot.IdaProotRuntime
 import dev.idadroid.util.safePid
+import dev.idadroid.util.runCatchingSuspending
+import dev.idadroid.util.terminateAndWait
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
@@ -139,9 +141,10 @@ class IdaMcpSessionManager private constructor(
             _state.update { current }
             return Result.failure(IllegalStateException("IDA MCP 正在启动或停止，请稍候…"))
         }
+        var launchedProcess: Process? = null
         try {
             val startResult = withContext(Dispatchers.IO) {
-                runCatching {
+                runCatchingSuspending {
                     require(paths.readyMarker.isFile && paths.rootfsDir.isDirectory) { "rootfs 尚未 ready，请先导入并验证环境" }
                     val idaHome = settingsStore?.envSettings?.value?.idaHome ?: dev.idadroid.settings.IdaDroidSettings.DEFAULT_IDA_HOME
                     val idaHomeGuest = idaHome.trimEnd('/')
@@ -160,9 +163,9 @@ class IdaMcpSessionManager private constructor(
                         if (activeProcess?.isAlive == true && activeProcessBind == launchSettings.bind) {
                             val running = runningState(launchSettings, "IDA MCP HTTP 已在端口 ${launchSettings.port} 运行")
                             _state.update { running }
-                            return@runCatching running
+                            return@runCatchingSuspending running
                         }
-                        runCatching { runtime.run(buildStopCommand(launchSettings), timeoutMs = 15_000) }
+                        runCatchingSuspending { runtime.run(buildStopCommand(launchSettings), timeoutMs = 15_000) }
                         if (!waitUntilPortClosed(launchSettings.port, timeoutMs = 10_000, bindHost = launchSettings.bindHost)) {
                             // The port is still held by something we cannot stop
                             // (e.g. a non-MCP process). Starting a replacement
@@ -188,12 +191,12 @@ class IdaMcpSessionManager private constructor(
                         startedAt = System.currentTimeMillis()
                     ) }
 
-                    activeProcess?.takeIf { it.isAlive }?.destroy()
+                    activeProcess?.terminateAndWait()
                     val spec = runtime.workspaceCommandSpec(buildStartCommand(launchSettings))
                     val process = ProcessBuilder(spec.command)
                         .directory(spec.workingDirectory)
                         .also { it.environment().putAll(spec.environment) }
-                        .start()
+                        .start().also { launchedProcess = it }
                     activeProcess = process
                     activeProcessBind = launchSettings.bind
                     pumpProcessOutput(process, logFile())
@@ -202,8 +205,7 @@ class IdaMcpSessionManager private constructor(
                     if (!ready) {
                         // Tear down the half-started process so it cannot keep
                         // holding the port or linger as a zombie.
-                        runCatching { process.destroy() }
-                        if (!process.waitFor(2, TimeUnit.SECONDS)) runCatching { process.destroyForcibly() }
+                        process.terminateAndWait()
                         activeProcess = null
                         activeProcessBind = null
                         val logTail = readLogTail(60).ifBlank { "暂无 ida-mcp-http.log" }
@@ -240,6 +242,20 @@ class IdaMcpSessionManager private constructor(
                 }
             }
             return startResult
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                launchedProcess?.let { process ->
+                    runCatching { process.terminateAndWait() }.onFailure(cancelled::addSuppressed)
+                    if (activeProcess === process) {
+                        activeProcess = null
+                        activeProcessBind = null
+                        stopWatchdog()
+                        fileTransferServer.stop()
+                        _state.update { it.copy(status = IdaMcpStatus.Stopped, pid = null, message = "启动已取消") }
+                    }
+                }
+            }
+            throw cancelled
         } finally {
             startStopMutex.unlock()
         }
@@ -249,20 +265,16 @@ class IdaMcpSessionManager private constructor(
         startStopMutex.lock()
         try {
             return withContext(Dispatchers.IO) {
-                runCatching {
+                runCatchingSuspending {
                     stopWatchdog()
                     fileTransferServer.stop()
                     val settings = _state.value.settings
-                    activeProcess?.let { process ->
-                        if (process.isAlive) {
-                            process.destroy()
-                            if (!process.waitFor(2, TimeUnit.SECONDS)) process.destroyForcibly()
-                        }
-                    }
+                    activeProcess?.terminateAndWait()
                     activeProcess = null
                     activeProcessBind = null
                     val result = runtime.run(buildStopCommand(settings), timeoutMs = 15_000)
-                    if (result.exitCode != 0 && !result.timedOut) {
+                    check(!result.timedOut) { "停止 IDA MCP 超时，环境保持不变" }
+                    if (result.exitCode != 0) {
                         throw IllegalStateException(result.stderr.ifBlank { result.stdout }.ifBlank { "停止命令失败" })
                     }
                     _state.update { IdaMcpSessionState(
@@ -279,7 +291,7 @@ class IdaMcpSessionManager private constructor(
     }
 
     suspend fun restart(settings: IdaMcpLaunchSettings = _state.value.settings): Result<IdaMcpSessionState> {
-        stop()
+        stop().getOrElse { return Result.failure(it) }
         return start(settings)
     }
 
@@ -569,10 +581,12 @@ class IdaMcpSessionManager private constructor(
                                 status = IdaMcpStatus.Starting,
                                 message = "监控检测到服务中断，正在自动重启…（第 $count 次）"
                             ) }
-                            runCatching { start(settings) }
+                            runCatchingSuspending { start(settings) }
                                 .onFailure { Log.e("IdaMcpSessionManager", "Auto-restart failed", it) }
                         }
                     }
+                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                    throw cancelled
                 } catch (e: Exception) {
                     Log.e("IdaMcpSessionManager", "Watchdog check failed", e)
                 }
