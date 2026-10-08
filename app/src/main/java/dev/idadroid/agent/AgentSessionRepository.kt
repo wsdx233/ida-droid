@@ -12,21 +12,13 @@ class AgentSessionRepository(
     private val paths: EnvironmentPaths
 ) {
     private val settings = dev.idadroid.settings.IdaDroidSettings(context.applicationContext)
+    private val containerFiles = dev.idadroid.files.ContainerFileManager(context, paths)
 
     private val workspaceProotPath: String
         get() = settings.envSettings.value.workspacePath.ifBlank { dev.idadroid.settings.IdaDroidSettings.DEFAULT_WORKSPACE_PATH }
 
-    /**
-     * 工作区在主机文件系统上的根目录。
-     * 与 PiAgentManager.workspaceHostRoot / AttachmentManager 保持同一规则：
-     * /root/xxx 在 rootfs 内；/sdcard、/storage 前缀由 proot 绑定，直接使用宿主同路径。
-     */
-    private val workspaceHostRoot: java.io.File get() {
-        val ws = workspaceProotPath
-        if (ws.startsWith("/root/")) return java.io.File(paths.rootfsDir, ws.removePrefix("/"))
-        if (ws.startsWith("/sdcard") || ws.startsWith("/storage")) return java.io.File(ws)
-        return java.io.File(paths.rootfsDir, ws.removePrefix("/").ifBlank { "root/pi_workspace" })
-    }
+    /** The selected workspace is always a real rootfs directory. */
+    private val workspaceHostRoot: java.io.File get() = containerFiles.rootfsFile(workspaceProotPath)
 
     private val storeFile: java.io.File get() = java.io.File(workspaceHostRoot, ".idadroid/agent-sessions.json")
 

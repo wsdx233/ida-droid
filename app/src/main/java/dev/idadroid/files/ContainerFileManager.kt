@@ -35,6 +35,37 @@ class ContainerFileManager(
     /** 由 proot 绑定到宿主同名路径的 guest 目录前缀（在 rootfs 之外）。 */
     private val externalGuestPrefixes = listOf("/sdcard", "/storage", "/mnt")
 
+
+    /** Rootfs-only picker: omit bind mounts and symlinks instead of exposing host storage. */
+    suspend fun listRootfsDirectories(path: String): List<ContainerFileEntry> = withContext(Dispatchers.IO) {
+        val normalized = dev.idadroid.settings.IdaDroidSettings.normalizeWorkspacePath(path)
+        val dir = rootfsFile(normalized)
+        require(dir.isDirectory) { "目录不存在：$normalized" }
+        val children = dir.listFiles() ?: error("无法读取目录：$normalized")
+        children.filter { child ->
+            val guestPath = if (normalized == "/") "/${child.name}" else "$normalized/${child.name}"
+            !java.nio.file.Files.isSymbolicLink(child.toPath()) &&
+                runCatching { dev.idadroid.settings.IdaDroidSettings.normalizeWorkspacePath(guestPath) }.isSuccess &&
+                child.isDirectory
+        }.map { it.toEntry(normalized) }.sortedBy { it.name }
+    }
+
+    /** Call on Dispatchers.IO. Reject symlinks in every segment, including missing-file parents. */
+    internal fun rootfsFile(path: String): File {
+        requireReady()
+        val normalized = dev.idadroid.settings.IdaDroidSettings.normalizeWorkspacePath(path)
+        val root = paths.rootfsDir.canonicalFile
+        var file = root
+        for (part in normalized.split('/').filter { it.isNotEmpty() }) {
+            file = File(file, part)
+            require(!java.nio.file.Files.isSymbolicLink(file.toPath())) { "工作区不支持符号链接：$path" }
+        }
+        val canonical = file.canonicalFile
+        require(canonical.path == root.path || canonical.path.startsWith(root.path + File.separator)) {
+            "路径越界：$path"
+        }
+        return canonical
+    }
     suspend fun listFiles(path: String): List<ContainerFileEntry> = withContext(Dispatchers.IO) {
         val dir = guestFile(path)
         require(dir.isDirectory) { "目录不存在：${normalizeGuestPath(path)}" }

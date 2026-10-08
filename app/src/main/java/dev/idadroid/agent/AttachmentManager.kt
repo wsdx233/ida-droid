@@ -40,14 +40,9 @@ class AttachmentManager(
 ) {
     private val appContext = context.applicationContext
     private val settings = dev.idadroid.settings.IdaDroidSettings(appContext)
+    private val containerFiles = dev.idadroid.files.ContainerFileManager(appContext, paths)
     private val workspaceProotPath: String get() = settings.envSettings.value.workspacePath.ifBlank { dev.idadroid.settings.IdaDroidSettings.DEFAULT_WORKSPACE_PATH }
-    private val uploadHostDir: File get() {
-        val ws = workspaceProotPath
-        // /root/xxx → rootfs 内；/sdcard、/storage 前缀由 proot 绑定，直接使用宿主同路径。
-        if (ws.startsWith("/root/")) return File(File(paths.rootfsDir, ws.removePrefix("/").ifBlank { "root/pi_workspace" }), ".upload")
-        if (ws.startsWith("/sdcard") || ws.startsWith("/storage")) return File(ws, ".upload")
-        return File(paths.rootfsDir, "${ws.removePrefix("/").ifBlank { "root/pi_workspace" }}/.upload")
-    }
+    private val uploadHostDir: File get() = containerFiles.rootfsFile("${workspaceProotPath.trimEnd('/')}/.upload")
     private val uploadProotPath: String get() = "$workspaceProotPath/.upload"
 
     suspend fun readDraft(uri: Uri, maxBytes: Long = 50L * 1024L * 1024L): DraftAttachment = withContext(Dispatchers.IO) {

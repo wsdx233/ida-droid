@@ -64,6 +64,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -100,7 +102,45 @@ internal fun ChatOptionSheets(
     onOpenConfig: () -> Unit,
     onSend: (String?) -> Unit
 ) {
-    if (showThinkingMenu) ModalBottomSheet(onDismissRequest = { onShowThinkingMenu(false) }) { SheetHeader(Icons.Rounded.Lightbulb, "思考强度", "选择推理强度"); ThinkingLevels.forEach { level -> ListItem(headlineContent = { Text(level) }, supportingContent = { Text(thinkingDescription(level)) }, leadingContent = { if (state.activeSession?.thinkingLevel == level) Icon(Icons.Rounded.CheckCircle, contentDescription = null, tint = MaterialTheme.colorScheme.primary) else Icon(Icons.Rounded.Settings, contentDescription = null) }, modifier = Modifier.clickable { onShowThinkingMenu(false); manager.chooseThinking(level) }) }; Spacer(Modifier.height(18.dp)) }
+    var pendingThinking by remember(state.activeSessionId) { mutableStateOf<String?>(null) }
+    var thinkingMessage by remember(state.activeSessionId) { mutableStateOf<String?>(null) }
+    if (showThinkingMenu) ModalBottomSheet(onDismissRequest = { onShowThinkingMenu(false) }) {
+        Column(Modifier.fillMaxWidth().heightIn(max = 600.dp).verticalScroll(rememberScrollState())) {
+            SheetHeader(Icons.Rounded.Lightbulb, "思考强度", "以 PI 实际应用的推理强度为准")
+            if (pendingThinking != null) {
+                LinearProgressIndicator(Modifier.fillMaxWidth().padding(horizontal = 18.dp))
+                Text("正在设置 $pendingThinking…", Modifier.padding(horizontal = 18.dp, vertical = 8.dp))
+            }
+            thinkingMessage?.let { message ->
+                Text(message, Modifier.padding(horizontal = 18.dp, vertical = 8.dp), color = MaterialTheme.colorScheme.error)
+            }
+            Text("模型必须实际支持思考/推理；自定义模型可在 AI 配置中声明能力，保存后重新启动 PI。",
+                Modifier.padding(horizontal = 18.dp, vertical = 8.dp), style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            OutlinedButton(onClick = { onShowThinkingMenu(false); onOpenConfig() },
+                enabled = pendingThinking == null, modifier = Modifier.padding(horizontal = 18.dp)) { Text("打开 AI 配置") }
+            ThinkingLevels.forEach { level ->
+                ListItem(
+                    headlineContent = { Text(level) },
+                    supportingContent = { Text(thinkingDescription(level)) },
+                    leadingContent = {
+                        if (state.activeSession?.thinkingLevel == level) Icon(Icons.Rounded.CheckCircle, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                        else Icon(Icons.Rounded.Settings, contentDescription = null)
+                    },
+                    modifier = Modifier.clickable(enabled = pendingThinking == null) {
+                        pendingThinking = level
+                        thinkingMessage = null
+                        manager.chooseThinking(level) { accepted, message ->
+                            pendingThinking = null
+                            thinkingMessage = if (accepted) null else message
+                            if (accepted) onShowThinkingMenu(false)
+                        }
+                    }
+                )
+            }
+            Spacer(Modifier.height(18.dp))
+        }
+    }
     if (showModelMenu) {
         var search by remember { mutableStateOf("") }
         var manualProvider by remember { mutableStateOf(state.activeSession?.provider.orEmpty()) }
@@ -270,7 +310,14 @@ internal fun PiSettingsTab(
 ) {
     var snapshot by remember { mutableStateOf(manager.getPiConfigSnapshot()) }
     var showModelsEditor by remember(initialShowModelsEditor) { mutableStateOf(initialShowModelsEditor) }
-    LaunchedEffect(state.piConfig) { if (!showModelsEditor) snapshot = state.piConfig }
+    val scope = rememberCoroutineScope()
+    var saving by remember { mutableStateOf(false) }
+    var saveMessage by remember { mutableStateOf<String?>(null) }
+    var publishedSnapshot by remember { mutableStateOf(state.piConfig) }
+    LaunchedEffect(state.piConfig) {
+        if (!showModelsEditor && (snapshot == publishedSnapshot || snapshot.materializedDir != state.piConfig.materializedDir)) snapshot = state.piConfig
+        publishedSnapshot = state.piConfig
+    }
 
     if (showModelsEditor) {
         AgentModelsEditorScreen(
@@ -279,12 +326,22 @@ internal fun PiSettingsTab(
                 showModelsEditor = false
                 onCloseEditor?.invoke()
             },
+            saveError = state.error,
             onApply = { modelsJson ->
-                val next = snapshot.copy(modelsText = modelsJson, modelCatalog = parseAgentModelCatalog(modelsJson))
-                snapshot = next
-                manager.savePiConfig(next)
-                showModelsEditor = false
-                onCloseEditor?.invoke()
+                val catalog = parseAgentModelCatalog(modelsJson)
+                val removedDefault = snapshot.modelCatalog.models.any { it.provider == snapshot.defaultProvider && it.id == snapshot.defaultModel } && catalog.models.none { it.provider == snapshot.defaultProvider && it.id == snapshot.defaultModel }
+                val removedProvider = snapshot.defaultProvider in snapshot.modelCatalog.providers && snapshot.defaultProvider !in catalog.providers
+                val replacement = catalog.models.firstOrNull()
+                val next = snapshot.copy(modelsText = modelsJson, modelCatalog = catalog,
+                    defaultProvider = if (removedDefault || removedProvider) replacement?.provider.orEmpty() else snapshot.defaultProvider,
+                    defaultModel = if (removedDefault || removedProvider) replacement?.id.orEmpty() else snapshot.defaultModel)
+                val success = manager.savePiConfig(next)
+                if (success) {
+                    snapshot = manager.getPiConfigSnapshot()
+                    showModelsEditor = false
+                    onCloseEditor?.invoke()
+                }
+                success
             }
         )
         return
@@ -293,6 +350,7 @@ internal fun PiSettingsTab(
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item { ElevatedCard(Modifier.fillMaxWidth()) { Column(Modifier.padding(14.dp)) { Text("Pi config", fontWeight = FontWeight.Bold); Text("PI_CODING_AGENT_DIR: ${snapshot.materializedDir}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) } } }
         item { state.error?.let { Text(it, color = MaterialTheme.colorScheme.error) } }
+        item { saveMessage?.let { Text(it, color = MaterialTheme.colorScheme.primary) } }
         // ── 可视化 AI 配置编辑器（取代旧的手动 JSON 编辑） ──
         item { AiConfigEditor(snapshot = snapshot, onSnapshotChange = { snapshot = it }) }
         item {
@@ -309,7 +367,23 @@ internal fun PiSettingsTab(
         // 这些功能已被 AiConfigEditor 可视化编辑器覆盖
         item { SettingsCard("系统提示词追加") { CodeTextField("APPEND_SYSTEM.md", snapshot.appendSystem) { snapshot = snapshot.copy(appendSystem = it) } } }
         item { OutlinedButton(onClick = { onOpenFullScreenEditor?.invoke() ?: run { showModelsEditor = true } }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Rounded.Settings, contentDescription = null); Spacer(Modifier.width(8.dp)); Text("编辑 models.json") } }
-        item { Button(onClick = { manager.savePiConfig(snapshot) }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Rounded.Save, contentDescription = null); Spacer(Modifier.width(8.dp)); Text("保存 Pi 配置") } }
+        item {
+            Button(onClick = {
+                val toSave = snapshot
+                saving = true
+                saveMessage = null
+                scope.launch {
+                    try {
+                        if (manager.savePiConfig(toSave)) {
+                            if (snapshot == toSave) snapshot = manager.getPiConfigSnapshot()
+                            saveMessage = "Pi 配置已保存"
+                        }
+                    } finally { saving = false }
+                }
+            }, enabled = !saving, modifier = Modifier.fillMaxWidth()) {
+                Icon(Icons.Rounded.Save, contentDescription = null); Spacer(Modifier.width(8.dp)); Text(if (saving) "保存中…" else "保存 Pi 配置")
+            }
+        }
     }
 }
 @Composable

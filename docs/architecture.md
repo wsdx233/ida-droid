@@ -37,7 +37,7 @@ idamcp-/
 │       │   ├── PiMessageNormalizer.kt # PI 消息格式标准化
 │       │   ├── PiConfigManager.kt    # 运行时配置物化与凭据隔离
 │       │   ├── AttachmentManager.kt  # 附件读取、限制和容器存储
-│       │   ├── WorkspaceManager.kt   # SAF 工作区文件管理
+│       │   ├── WorkspaceManager.kt   # 容器工作区目录与文件管理
 │       │   ├── AgentSessionRepository.kt # Session 原子持久化
 │       │   ├── AgentModelCatalog.kt   # 模型目录解析
 │       │   └── AgentModels.kt         # Agent 状态和消息模型
@@ -86,7 +86,9 @@ Manager 处理 `agent_start/end/settled`、`message_*`、工具执行、重试�
 
 - `AgentSessionRepository` 以原子临时文件更新 `.idadroid/agent-sessions.json`，索引损坏或写盘失败会显式报错，不能静默覆盖用户数据。
 - PI session 文件位于 `.idadroid/pi-sessions/`；旧 IDAdroid JSONL 历史只在确认可转换后写入 PI v3 tree，原文件保持不变。
-- `PiConfigManager` 将用户配置物化到私有 runtime 目录，转换旧 `baseURL`/`envKey` 字段为 PI 的 `baseUrl`/`api`/`apiKey`，诊断消息会脱敏。受管理的 `--mode`、`--session` 和 session 目录参数不可被 extra args 覆盖。
+- `PiConfigManager` 在写盘前验证模型、环境变量和受管理的 RPC 参数，将旧 `baseURL`/`envKey` 转成 PI 的 `baseUrl`/`api`/`apiKey`，保留未知配置字段并物化到私有 runtime 目录。诊断消息会脱敏，未解析的凭据引用交由 PI 处理；受管理的 `--mode`、`--session` 和 session 目录参数不可被 extra args 覆盖。
+- `IdaDroidSettings.envSettings.workspacePath` 是工作区唯一来源，Agent 与设置页共用 rootfs 目录选择器。文件、配置、session 和附件均使用此容器路径，不再另存 SAF tree URI。外部绑定路径、路径越界和符号链接不可选。
+- 切换工作区时停止旧 RPC 并清空旧 UI 状态，然后加载该目录的配置、session 和文件；原目录保持不变。目录读取独立于 PI 连接失败，只有最新浏览请求可发布列表。工作区文件附件进入对应 session 的私有草稿，而不是只读取后丢弃。
 
 ### Agent UI
 
@@ -137,7 +139,14 @@ AgentComposer
 
 ### 模型目录 (`models.json`)
 
-定义各 Provider 的 baseURL、API Key 环境变量名、推荐模型列表。
+使用 PI 原生 `baseUrl`、`api`、`apiKey` 和模型列表，支持凭据环境变量引用；简易表单与完整编辑器均保留 Provider、模型、compat、headers 等扩展字段。配置保存等待实际写盘与运行时物化完成，失败不发布新快照或关闭编辑器。
+
+外层选择器支持独立 ID 的多个自定义 Provider；模型的 `reasoning` 能力由用户明确声明。思考强度选择以 PI 返回的实际 `thinkingLevel` 为准，不支持或被钳制时不会伪装成已应用。
+
+### PI 更新
+
+`IdaDroidApplication` 持有 `PiUpdateManager`，启动就绪后检测新版并请求用户确认。忽略记录按环境与更新版本生效。更新先安装、校验新的独立 npm prefix，再原子切换已有启动器；旧包保留供正在运行的进程使用，检测或安装失败不阻止已安装版本运行。
+
 
 ### Session 存储 (`agent-sessions.json`)
 

@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.rounded.Delete
@@ -21,6 +22,8 @@ import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material.icons.rounded.Upload
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.dynamicDarkColorScheme
@@ -47,6 +50,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.DialogProperties
 import dev.idadroid.R
 import dev.idadroid.agent.DraftAttachment
 import dev.idadroid.IdaDroidApplication
@@ -66,8 +70,11 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.UUID
 
 private enum class IdaDroidScreen { Home, Settings, Agent, About }
+// Save this process's check marker across rotation, but not across a new process launch.
+private val piUpdateStartupToken = UUID.randomUUID().toString()
 
 @Composable
 fun IdaDroidApp(
@@ -96,16 +103,20 @@ fun IdaDroidApp(
         Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
             val manager = remember { EnvironmentManager(context.applicationContext) }
             val vncManager = remember { VncSessionManager(context.applicationContext, settingsStore) }
-            val agentManager = (context.applicationContext as IdaDroidApplication).agentManager
+            val application = context.applicationContext as IdaDroidApplication
+            val agentManager = application.agentManager
+            val piUpdateManager = application.piUpdateManager
             val fileManager = remember { ContainerFileManager(context.applicationContext) }
             val mcpManager = remember { IdaMcpSessionManager.get(context.applicationContext, settingsStore) }
             val envState by manager.state.collectAsStateWithLifecycle()
             val guiState by vncManager.state.collectAsStateWithLifecycle()
             val agentState by agentManager.state.collectAsStateWithLifecycle()
             val mcpState by mcpManager.state.collectAsStateWithLifecycle()
+            val piUpdateState by piUpdateManager.state.collectAsStateWithLifecycle()
             val vncSettings by settingsStore.vncSettings.collectAsStateWithLifecycle()
             val scope = rememberCoroutineScope()
             var currentScreen by rememberSaveable { mutableStateOf(if (initialAgent) IdaDroidScreen.Agent else IdaDroidScreen.Home) }
+            var startupPiCheckToken by rememberSaveable { mutableStateOf<String?>(null) }
             // React to Agent-screen requests arriving while the activity already
             // exists (floating window "Agent 聊天" routes through onNewIntent).
             val agentRequestTick by (agentRequest ?: remember { MutableStateFlow(0) }).collectAsStateWithLifecycle()
@@ -129,6 +140,12 @@ fun IdaDroidApp(
                     vncManager.probe()
                     mcpManager.probe()
                     agentManager.refresh(createDefaultIfReady = true)
+                }
+            }
+            LaunchedEffect(envState.isReady) {
+                if (envState.isReady && startupPiCheckToken != piUpdateStartupToken) {
+                    startupPiCheckToken = piUpdateStartupToken
+                    piUpdateManager.checkAtStartup()
                 }
             }
 
@@ -205,6 +222,11 @@ fun IdaDroidApp(
                 transientMessage
                     ?.takeIf { it.isNotBlank() }
                     ?.let { snackbarHostState.showSnackbar(it) }
+            }
+            LaunchedEffect(piUpdateState.message) {
+                val message = piUpdateState.message ?: return@LaunchedEffect
+                snackbarHostState.showSnackbar(message)
+                piUpdateManager.clearMessage(message)
             }
 
             Box(Modifier.fillMaxSize()) {
@@ -487,6 +509,60 @@ fun IdaDroidApp(
                             )
                         }
                     }
+                )
+            }
+            val piUpdate = piUpdateState.available
+            if (piUpdate != null) {
+                var ignorePiVersion by rememberSaveable(piUpdate.availableVersion) { mutableStateOf(false) }
+                AlertDialog(
+                    onDismissRequest = {
+                        if (!piUpdateState.updating) {
+                            piUpdateManager.dismissUpdate(ignoreVersion = ignorePiVersion)
+                        }
+                    },
+                    title = { Text("PI 更新") },
+                    text = {
+                        Column {
+                            Text("已安装：${piUpdate.installedVersion}\n最新版本：${piUpdate.availableVersion}")
+                            Text(
+                                "更新不会修改配置，也不会停止正在运行的任务。已有 PI 会话需重启或重新连接后使用新版本。",
+                                modifier = Modifier.padding(top = 12.dp)
+                            )
+                            if (piUpdateState.updating) {
+                                Row(
+                                    modifier = Modifier.padding(top = 16.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    CircularProgressIndicator(modifier = Modifier.size(20.dp))
+                                    Text("正在更新 PI…", modifier = Modifier.padding(start = 12.dp))
+                                }
+                            } else {
+                                Row(
+                                    modifier = Modifier.padding(top = 12.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Checkbox(checked = ignorePiVersion, onCheckedChange = { ignorePiVersion = it })
+                                    Text("此版本不再提示")
+                                }
+                            }
+                        }
+                    },
+                    confirmButton = {
+                        TextButton(onClick = { piUpdateManager.update() }, enabled = !piUpdateState.updating) {
+                            Text(if (piUpdateState.updating) "更新中…" else "更新")
+                        }
+                    },
+                    dismissButton = {
+                        if (!piUpdateState.updating) {
+                            TextButton(onClick = {
+                                piUpdateManager.dismissUpdate(ignoreVersion = ignorePiVersion)
+                            }) { Text("稍后") }
+                        }
+                    },
+                    properties = DialogProperties(
+                        dismissOnBackPress = !piUpdateState.updating,
+                        dismissOnClickOutside = !piUpdateState.updating
+                    )
                 )
             }
 

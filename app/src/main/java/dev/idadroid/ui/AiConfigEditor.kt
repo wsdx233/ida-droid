@@ -16,9 +16,10 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Check
@@ -48,6 +49,7 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.Switch
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
@@ -56,6 +58,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -69,7 +72,10 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.idadroid.agent.ConfigExport
-import dev.idadroid.agent.EndpointCompleter
+import dev.idadroid.agent.customPiModel
+import dev.idadroid.agent.defaultProviderApi
+import dev.idadroid.agent.normalizePiProvider
+import dev.idadroid.agent.parsePiModels
 import dev.idadroid.agent.PiConfigSnapshot
 import dev.idadroid.agent.TestResult
 import dev.idadroid.agent.parseAgentModelCatalog
@@ -80,11 +86,10 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.buildJsonArray
-import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
+import java.net.URI
 
 // ─── Provider catalog ──────────────────────────────────────────────────────────
 
@@ -138,101 +143,61 @@ private fun presetById(id: String): ProviderPreset? = PROVIDER_PRESETS.firstOrNu
 
 // ─── Data classes for JSON parsing ─────────────────────────────────────────────
 
-private data class ModelConfig(val id: String, val provider: String, val name: String)
+private data class ModelConfig(val id: String, val provider: String, val name: String, val raw: JsonObject = customPiModel(id))
 private data class ProviderConfig(
     val id: String, val displayName: String, val baseUrl: String,
-    val envKey: String, val color: Color, val apiKey: String, val models: List<ModelConfig>
+    val envKey: String, val color: Color, val apiKey: String, val models: List<ModelConfig>,
+    val api: String = defaultProviderApi(id), val raw: JsonObject = JsonObject(emptyMap())
 )
 private data class ParsedConfig(
     val providers: List<ProviderConfig>, val models: List<ModelConfig>,
-    val env: Map<String, String>, val parseError: String?
+    val env: Map<String, String>, val parseError: String?, val root: JsonObject = JsonObject(emptyMap())
 )
 
-private fun parseConfig(modelsText: String, envText: String): ParsedConfig {
-    val json = Json { ignoreUnknownKeys = true; isLenient = true }
-    return try {
-        val modelsObj = if (modelsText.isBlank()) JsonObject(emptyMap()) else json.parseToJsonElement(modelsText).jsonObject
-        val envObj = if (envText.isBlank()) emptyMap() else json.parseToJsonElement(envText).let { (it as? JsonObject)?.mapValues { it.value.jsonPrimitive.contentOrNull ?: "" } ?: emptyMap() }
-        val providersList = mutableListOf<ProviderConfig>()
-        val modelsList = mutableListOf<ModelConfig>()
-        val providersObj = modelsObj["providers"] as? JsonObject ?: JsonObject(emptyMap())
-        providersObj.forEach { (providerId, element) ->
-            val id = providerId.trim()
-            if (id.isBlank()) return@forEach
-            val obj = element as? JsonObject ?: JsonObject(emptyMap())
-            val baseUrl = obj["baseURL"]?.jsonPrimitive?.contentOrNull ?: obj["baseUrl"]?.jsonPrimitive?.contentOrNull ?: ""
-            val envKey = obj["envKey"]?.jsonPrimitive?.contentOrNull ?: "${id.uppercase()}_API_KEY"
-            val apiKey = envObj[envKey] ?: ""
-            val preset = presetById(id)
-            val displayName = obj["displayName"]?.jsonPrimitive?.contentOrNull ?: preset?.displayName ?: id
-            val color = preset?.color ?: Color(0xFF6B7280)
-            val providerModels = (obj["models"] as? JsonArray)?.mapNotNull { item ->
-                val modelObj = item as? JsonObject ?: return@mapNotNull null
-                val mid = modelObj["id"]?.jsonPrimitive?.contentOrNull?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-                val mname = modelObj["name"]?.jsonPrimitive?.contentOrNull ?: mid
-                ModelConfig(mid, id, mname)
-            } ?: emptyList()
-            providersList.add(ProviderConfig(id, displayName, baseUrl, envKey, color, apiKey, providerModels))
-            modelsList.addAll(providerModels)
-        }
-        ParsedConfig(providersList, modelsList, envObj, null)
-    } catch (e: Exception) {
-        ParsedConfig(emptyList(), emptyList(), emptyMap(), e.message ?: "解析失败")
+private fun parseConfig(modelsText: String, envText: String): ParsedConfig = try {
+    val root = parsePiModels(modelsText, validateValues = false)
+    val env = Json.parseToJsonElement(envText.ifBlank { "{}" }) as? JsonObject ?: error("环境配置必须是 JSON object")
+    val values = env.mapValues { (_, value) ->
+        (value as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull ?: error("环境变量值必须是字符串")
     }
+    val providers = (root["providers"] as? JsonObject).orEmpty().map { (id, element) ->
+        val raw = normalizePiProvider(id, element as JsonObject)
+        val key = (raw["apiKey"] as? JsonPrimitive)?.contentOrNull.orEmpty()
+        val models = (raw["models"] as? JsonArray).orEmpty().map { item ->
+            val obj = item as JsonObject
+            val mid = obj["id"]!!.jsonPrimitive.content
+            ModelConfig(mid, id, (obj["name"] as? JsonPrimitive)?.contentOrNull ?: mid, obj)
+        }
+        val preset = presetById(id)
+        ProviderConfig(id, (raw["displayName"] as? JsonPrimitive)?.contentOrNull ?: preset?.displayName ?: id,
+            (raw["baseUrl"] as? JsonPrimitive)?.contentOrNull.orEmpty(),
+            key.takeIf { it in values }.orEmpty(), preset?.color ?: Color(0xFF6B7280), values[key] ?: key,
+            models, (raw["api"] as? JsonPrimitive)?.contentOrNull ?: defaultProviderApi(id), raw)
+    }
+    ParsedConfig(providers, providers.flatMap { it.models }, values, null, root)
+} catch (_: Exception) {
+    ParsedConfig(emptyList(), emptyList(), emptyMap(), "无效配置；原始内容保留。请修复原始 JSON。")
 }
 
-private fun buildModelsJson(providers: List<ProviderConfig>): String {
-    val json = Json { prettyPrint = true }
-    // 格式: { "providers": { "openai": { "baseURL":"...", "envKey":"...", "models":[...] } } }
-    val providersObj = buildJsonObject {
-        put("providers", buildJsonObject {
-            providers.forEach { p ->
-                put(p.id, buildJsonObject {
-                    if (p.baseUrl.isNotBlank()) put("baseURL", JsonPrimitive(p.baseUrl))
-                    put("envKey", JsonPrimitive(p.envKey))
-                    if (p.displayName != p.id) put("displayName", JsonPrimitive(p.displayName))
-                    put("models", buildJsonArray {
-                        p.models.forEach { m ->
-                            add(buildJsonObject {
-                                put("id", JsonPrimitive(m.id))
-                                if (m.name.isNotBlank() && m.name != m.id) put("name", JsonPrimitive(m.name))
-                            })
-                        }
-                    })
-                })
-            }
+private fun buildModelsJson(providers: List<ProviderConfig>, root: JsonObject): String {
+    val providerMap = providers.associate { p ->
+        p.id to JsonObject(p.raw.toMutableMap().apply {
+            remove("baseURL"); remove("envKey")
+            put("displayName", JsonPrimitive(p.displayName))
+            if (p.baseUrl.isNotBlank()) put("baseUrl", JsonPrimitive(p.baseUrl)) else remove("baseUrl")
+            put("api", JsonPrimitive(p.api))
+            if (p.envKey.isNotBlank()) put("apiKey", JsonPrimitive(p.envKey))
+            else if (p.apiKey.isNotBlank()) put("apiKey", JsonPrimitive(p.apiKey)) else remove("apiKey")
+            if (p.models.isNotEmpty()) put("models", JsonArray(p.models.map { it.raw }))
         })
     }
-    return json.encodeToString(JsonObject.serializer(), providersObj)
+    return Json { prettyPrint = true }.encodeToString(JsonObject.serializer(), JsonObject(root + ("providers" to JsonObject(providerMap))))
 }
 
 private fun rebuildEnv(env: Map<String, String>, providers: List<ProviderConfig>): String {
     val merged = env.toMutableMap()
-    providers.forEach { p -> if (p.apiKey.isNotBlank()) merged[p.envKey] = p.apiKey else merged.remove(p.envKey) }
-    val obj = buildJsonObject { merged.forEach { (k, v) -> put(k, JsonPrimitive(v)) } }
-    return Json { prettyPrint = true }.encodeToString(JsonObject.serializer(), obj)
-}
-
-private fun removeEnvKeys(env: Map<String, String>, keys: List<String>): String {
-    val filtered = env.filterKeys { it !in keys }
-    val obj = buildJsonObject { filtered.forEach { (k, v) -> put(k, JsonPrimitive(v)) } }
-    return Json { prettyPrint = true }.encodeToString(JsonObject.serializer(), obj)
-}
-
-private fun validateApiKeyFormat(providerId: String, apiKey: String): Boolean {
-    val key = apiKey.trim()
-    if (key.length < 10) return false
-    return when (providerId) {
-        "openai" -> key.startsWith("sk-") && key.length >= 20
-        "anthropic" -> key.startsWith("sk-ant-")
-        "google" -> key.startsWith("AI") && key.length >= 20
-        "openrouter" -> key.startsWith("sk-or-")
-        "moonshot" -> key.startsWith("sk-")
-        "groq" -> key.startsWith("gsk_")
-        "xai" -> key.startsWith("xai-")
-        "siliconflow" -> key.startsWith("sk-")
-        else -> true
-    }
+    providers.forEach { p -> if (p.envKey.isNotBlank()) merged[p.envKey] = p.apiKey }
+    return Json { prettyPrint = true }.encodeToString(JsonObject.serializer(), JsonObject(merged.mapValues { JsonPrimitive(it.value) }))
 }
 
 // ─── Main UI: Operit-style simple form ────────────────────────────────────────
@@ -254,6 +219,7 @@ fun AiConfigEditor(
     var testingProvider by remember { mutableStateOf<String?>(null) }
     var showModelPicker by remember { mutableStateOf(false) }
     var showProviderPicker by remember { mutableStateOf(false) }
+    var showCreateProvider by remember { mutableStateOf(false) }
 
     // 当前选中的 provider — 始终是 ProviderConfig 类型
     val currentProvider = remember(parsed.providers, snapshot.defaultProvider) {
@@ -261,15 +227,14 @@ fun AiConfigEditor(
             ?: parsed.providers.firstOrNull()
             ?: run {
                 val p = PROVIDER_PRESETS.first()
-                ProviderConfig(id = p.id, displayName = p.displayName, baseUrl = p.baseUrl, envKey = p.envKey, color = p.color, apiKey = "", models = emptyList())
+                ProviderConfig(id = p.id, displayName = p.displayName, baseUrl = p.baseUrl, envKey = "", color = p.color, apiKey = "", models = emptyList())
             }
     }
-    val preset = presetById(currentProvider.id) ?: PROVIDER_PRESETS.last()
-
-    // 本地输入缓冲 — 避免每次按键都触发 snapshot 重算导致输入被覆盖
-    var baseUrlInput by remember(currentProvider.id) { mutableStateOf(currentProvider.baseUrl) }
-    var apiKeyInput by remember(currentProvider.id) { mutableStateOf(currentProvider.apiKey) }
-    var modelInput by remember(currentProvider.id) { mutableStateOf(snapshot.defaultModel) }
+    val latestSnapshot by rememberUpdatedState(snapshot)
+    val latestOnChange by rememberUpdatedState(onSnapshotChange)
+    val baseUrlInput = currentProvider.baseUrl
+    val apiKeyInput = currentProvider.apiKey
+    val modelInput = snapshot.defaultModel
 
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         // ── 状态提示 ──
@@ -285,77 +250,76 @@ fun AiConfigEditor(
                 Text("AI 配置", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleSmall)
 
                 // Provider 选择 (点击打开搜索弹窗)
-                OutlinedTextField(
-                    value = currentProvider.displayName,
-                    onValueChange = {},
-                    readOnly = true,
-                    label = { Text("Provider") },
-                    leadingIcon = { Box(Modifier.size(24.dp).clip(CircleShape).background(currentProvider.color), contentAlignment = Alignment.Center) { Text(currentProvider.displayName.take(1), color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold) } },
-                    trailingIcon = { Icon(Icons.Rounded.ExpandMore, contentDescription = null) },
-                    modifier = Modifier.fillMaxWidth().clickable { showProviderPicker = true }
-                )
+                OutlinedButton(onClick = { showProviderPicker = true }, enabled = parsed.parseError == null, modifier = Modifier.fillMaxWidth()) {
+                    Box(Modifier.size(24.dp).clip(CircleShape).background(currentProvider.color), contentAlignment = Alignment.Center) { Text(currentProvider.displayName.take(1), color = Color.White, fontSize = 12.sp) }
+                    Spacer(Modifier.width(8.dp))
+                    Text("${currentProvider.displayName} · ${currentProvider.id}", modifier = Modifier.weight(1f))
+                    Icon(Icons.Rounded.ExpandMore, contentDescription = "选择 Provider")
+                }
 
-                // Base URL (自动填充，可编辑) — 本地缓冲，失焦写回
                 OutlinedTextField(
                     value = baseUrlInput,
-                    onValueChange = { baseUrlInput = it },
+                    onValueChange = { updateProvider(snapshot, parsed, currentProvider.copy(baseUrl = it), onSnapshotChange) },
+                    enabled = parsed.parseError == null,
                     label = { Text("Base URL") },
                     leadingIcon = { Icon(Icons.Rounded.Public, contentDescription = null) },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
-                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
-                    keyboardActions = KeyboardActions(onDone = {
-                        updateProvider(snapshot, parsed, currentProvider.copy(baseUrl = baseUrlInput), onSnapshotChange)
-                    })
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done)
                 )
-                // 端点补全提示
-                if (currentProvider.baseUrl.isNotBlank() && !currentProvider.baseUrl.endsWith("#")) {
-                    val completed = EndpointCompleter.complete(currentProvider.baseUrl, currentProvider.id)
-                    if (completed != currentProvider.baseUrl.trim().removeSuffix("/")) {
-                        Text("→ 实际请求: $completed", fontSize = 10.sp, fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                }
 
-                // API Key — 本地缓冲，失焦写回
+                // Every keystroke is part of the snapshot, including direct Save/export.
                 var showKey by remember { mutableStateOf(false) }
                 OutlinedTextField(
                     value = apiKeyInput,
-                    onValueChange = { apiKeyInput = it },
+                    onValueChange = { updateProvider(snapshot, parsed, currentProvider.copy(apiKey = it), onSnapshotChange) },
+                    enabled = parsed.parseError == null,
                     label = { Text("API Key") },
                     leadingIcon = { Icon(Icons.Rounded.Key, contentDescription = null) },
                     trailingIcon = { IconButton(onClick = { showKey = !showKey }) { Icon(if (showKey) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore, contentDescription = if (showKey) "隐藏" else "显示") } },
                     visualTransformation = if (showKey) VisualTransformation.None else PasswordVisualTransformation(),
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = ImeAction.Done),
-                    keyboardActions = KeyboardActions(onDone = {
-                        updateProvider(snapshot, parsed, currentProvider.copy(apiKey = apiKeyInput.trim()), onSnapshotChange)
-                    }),
                     modifier = Modifier.fillMaxWidth()
                 )
-                // Key 格式校验提示
-                if (currentProvider.apiKey.isNotBlank() && currentProvider.id != "openai-generic") {
-                    if (!validateApiKeyFormat(currentProvider.id, currentProvider.apiKey)) {
-                        Text("⚠️ API Key 格式可能不正确", fontSize = 11.sp, color = MaterialTheme.colorScheme.error)
-                    }
-                }
+                OutlinedTextField(
+                    value = currentProvider.api,
+                    onValueChange = { updateProvider(snapshot, parsed, currentProvider.copy(api = it), onSnapshotChange) },
+                    enabled = parsed.parseError == null,
+                    label = { Text("API Type") },
+                    supportingText = { Text("openai-completions / openai-responses / anthropic-messages / google-generative-ai") },
+                    singleLine = true, modifier = Modifier.fillMaxWidth()
+                )
 
-                // Model Name + 选择按钮 — 本地缓冲，失焦写回
+                // The default model is materialized on Save; picker selections add definitions.
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                     OutlinedTextField(
                         value = modelInput,
-                        onValueChange = { modelInput = it },
+                        onValueChange = { onSnapshotChange(snapshot.copy(defaultModel = it, defaultProvider = currentProvider.id)) },
+                        enabled = parsed.parseError == null,
                         label = { Text("Model") },
                         singleLine = true,
                         modifier = Modifier.weight(1f),
-                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
-                        keyboardActions = KeyboardActions(onDone = {
-                            onSnapshotChange(snapshot.copy(defaultModel = modelInput.trim(), defaultProvider = currentProvider.id))
-                        })
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done)
                     )
                     IconButton(onClick = { showModelPicker = true }) {
                         Icon(Icons.Rounded.ExpandMore, contentDescription = "选择模型")
                     }
                 }
+                ModelReasoningControl(
+                    checked = (currentProvider.models.firstOrNull { it.id == modelInput.trim() }?.raw?.get("reasoning") as? JsonPrimitive)?.booleanOrNull == true,
+                    enabled = parsed.parseError == null && modelInput.isNotBlank(),
+                    onCheckedChange = { reasoning ->
+                        val id = modelInput.trim()
+                        val model = currentProvider.models.firstOrNull { it.id == id }
+                            ?: ModelConfig(id, currentProvider.id, id)
+                        val updated = model.copy(raw = JsonObject(model.raw + ("reasoning" to JsonPrimitive(reasoning))))
+                        val models = if (currentProvider.models.any { it.id == id }) {
+                            currentProvider.models.map { if (it.id == id) updated else it }
+                        } else currentProvider.models + updated
+                        updateProvider(snapshot.copy(defaultModel = id), parsed, currentProvider.copy(models = models), onSnapshotChange)
+                    }
+                )
 
                 // 推荐模型 chips
                 MODEL_SUGGESTIONS[currentProvider.id]?.let { suggestions ->
@@ -364,10 +328,7 @@ fun AiConfigEditor(
                         androidx.compose.foundation.layout.FlowRow(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                             unadded.take(5).forEach { modelId ->
                                 AssistChip(
-                                    onClick = {
-                                        modelInput = modelId
-                                        onSnapshotChange(snapshot.copy(defaultModel = modelId, defaultProvider = currentProvider.id))
-                                    },
+                                    onClick = { selectModel(snapshot, parsed, currentProvider, modelId, onSnapshotChange) },
                                     label = { Text(modelId, fontSize = 11.sp) }
                                 )
                             }
@@ -379,9 +340,7 @@ fun AiConfigEditor(
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(
                         onClick = {
-                            // 先把输入缓冲写回，再测试
-                            val provider = currentProvider.copy(apiKey = apiKeyInput.trim(), baseUrl = baseUrlInput.trim())
-                            updateProvider(snapshot, parsed, provider, onSnapshotChange)
+                            val provider = currentProvider
                             testingProvider = currentProvider.id
                             scope.launch {
                                 val result = withContext(Dispatchers.IO) { testProviderConnection(provider) }
@@ -389,7 +348,7 @@ fun AiConfigEditor(
                                 snackbarHost.showSnackbar(if (result.success) "✅ ${provider.displayName} 连接成功" else "❌ ${result.message}")
                             }
                         },
-                        enabled = testingProvider == null && apiKeyInput.isNotBlank(),
+                        enabled = testingProvider == null && parsed.parseError == null && baseUrlInput.isNotBlank(),
                         modifier = Modifier.weight(1f)
                     ) {
                         if (testingProvider == currentProvider.id) { CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp) }
@@ -398,20 +357,22 @@ fun AiConfigEditor(
                     }
                     OutlinedButton(
                         onClick = {
-                            val provider = currentProvider.copy(apiKey = apiKeyInput.trim(), baseUrl = baseUrlInput.trim())
-                            updateProvider(snapshot, parsed, provider, onSnapshotChange)
+                            val provider = currentProvider
                             testingProvider = "${currentProvider.id}_fetch"
                             scope.launch {
-                                val models = withContext(Dispatchers.IO) { fetchAvailableModels(provider) }
+                                val result = withContext(Dispatchers.IO) { testProviderConnection(provider) }
                                 testingProvider = null
-                                if (models.isNotEmpty()) {
-                                    val updated = provider.copy(models = models.map { ModelConfig(it, provider.id, it) })
-                                    updateProvider(snapshot, parsed, updated, onSnapshotChange)
-                                    snackbarHost.showSnackbar("已拉取 ${models.size} 个模型")
-                                } else { snackbarHost.showSnackbar("拉取失败或未返回模型") }
+                                val now = latestSnapshot
+                                if (now.materializedDir != snapshot.materializedDir || now.modelsText != snapshot.modelsText || now.envText != snapshot.envText || now.defaultProvider != snapshot.defaultProvider || now.defaultModel != snapshot.defaultModel) {
+                                    snackbarHost.showSnackbar("配置已更改；未应用过期的模型列表")
+                                } else if (result.success && result.availableModels.isNotEmpty()) {
+                                    val additions = result.availableModels.filter { id -> provider.models.none { it.id == id } }.map { ModelConfig(it, provider.id, it) }
+                                    updateProvider(now, parseConfig(now.modelsText, now.envText), provider.copy(models = provider.models + additions), latestOnChange)
+                                    snackbarHost.showSnackbar("已拉取 ${result.availableModels.size} 个模型")
+                                } else { snackbarHost.showSnackbar(if (result.success) "服务未返回模型" else "❌ ${result.message}") }
                             }
                         },
-                        enabled = testingProvider == null && apiKeyInput.isNotBlank(),
+                        enabled = testingProvider == null && parsed.parseError == null && baseUrlInput.isNotBlank(),
                         modifier = Modifier.weight(1f)
                     ) {
                         if (testingProvider == "${currentProvider.id}_fetch") { CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp) }
@@ -531,8 +492,7 @@ fun AiConfigEditor(
                 // 如果搜索的内容不在列表里，可以直接用它作为模型名
                 if (modelSearch.isNotBlank() && allModels.none { it.equals(modelSearch, ignoreCase = true) }) {
                     Surface(modifier = Modifier.fillMaxWidth().clickable {
-                        modelInput = modelSearch.trim()
-                        onSnapshotChange(snapshot.copy(defaultModel = modelSearch.trim(), defaultProvider = currentProvider.id)); showModelPicker = false
+                        selectModel(snapshot, parsed, currentProvider, modelSearch, onSnapshotChange); showModelPicker = false
                     }, shape = RoundedCornerShape(8.dp), color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.3f)) {
                         Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                             Icon(Icons.Rounded.Add, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
@@ -547,8 +507,7 @@ fun AiConfigEditor(
                         val isConfigured = currentProvider.models.any { it.id == modelId }
                         val isSelected = modelId == snapshot.defaultModel
                         Surface(modifier = Modifier.fillMaxWidth().clickable {
-                            modelInput = modelId
-                            onSnapshotChange(snapshot.copy(defaultModel = modelId, defaultProvider = currentProvider.id)); showModelPicker = false
+                            selectModel(snapshot, parsed, currentProvider, modelId, onSnapshotChange); showModelPicker = false
                         }, shape = RoundedCornerShape(8.dp), color = if (isSelected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)) {
                             Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
                                 Icon(Icons.Rounded.SmartToy, contentDescription = null, tint = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(18.dp))
@@ -568,13 +527,20 @@ fun AiConfigEditor(
     // ── Provider picker dialog (搜索 + 列表) ──
     if (showProviderPicker) {
         var providerSearch by remember { mutableStateOf("") }
-        val filteredPresets = remember(providerSearch) {
-            if (providerSearch.isEmpty()) PROVIDER_PRESETS
-            else PROVIDER_PRESETS.filter { it.displayName.contains(providerSearch, ignoreCase = true) || it.id.contains(providerSearch, ignoreCase = true) || it.description.contains(providerSearch, ignoreCase = true) }
+        val filteredPresets = remember(providerSearch, parsed.providers) {
+            val configured = parsed.providers.map { p -> ProviderPreset(p.id, p.displayName, p.baseUrl, p.envKey, p.color, "已配置 · ${p.api}") }
+            (configured + PROVIDER_PRESETS.filter { preset -> configured.none { it.id == preset.id } }).filter { it.displayName.contains(providerSearch, ignoreCase = true) || it.id.contains(providerSearch, ignoreCase = true) || it.description.contains(providerSearch, ignoreCase = true) }
         }
         AlertDialog(
             onDismissRequest = { showProviderPicker = false },
-            title = { Text("选择 Provider") },
+            title = {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("选择 Provider", modifier = Modifier.weight(1f))
+                    IconButton(onClick = { showProviderPicker = false; showCreateProvider = true }) {
+                        Icon(Icons.Rounded.Add, contentDescription = "新建自定义 Provider")
+                    }
+                }
+            },
             text = {
                 Column(Modifier.fillMaxWidth()) {
                     OutlinedTextField(
@@ -597,6 +563,7 @@ fun AiConfigEditor(
                                     Spacer(Modifier.width(10.dp))
                                     Column(Modifier.weight(1f)) {
                                         Text(p.displayName, fontWeight = FontWeight.Medium, fontSize = 13.sp)
+                                        Text(p.id, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                         Text(p.description, fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                     }
                                     if (p.id == currentProvider.id) Icon(Icons.Rounded.Check, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
@@ -607,6 +574,17 @@ fun AiConfigEditor(
                 }
             },
             confirmButton = { TextButton(onClick = { showProviderPicker = false }) { Text("取消") } }
+        )
+    }
+
+    if (showCreateProvider) {
+        CustomProviderDialog(
+            existingIds = (parsed.providers.map { it.id } + PROVIDER_PRESETS.map { it.id }).toSet(),
+            onDismiss = { showCreateProvider = false; showProviderPicker = true },
+            onCreate = { provider ->
+                selectProvider(snapshot, parsed, provider, onSnapshotChange)
+                showCreateProvider = false
+            }
         )
     }
 
@@ -646,7 +624,7 @@ fun AiConfigEditor(
                 }
             },
             confirmButton = { TextButton(onClick = {
-                parseImportedConfig(importText.trim())?.let { onSnapshotChange(it); scope.launch { snackbarHost.showSnackbar("配置导入成功") }; showImportDialog = false }
+                parseImportedConfig(importText.trim())?.let { onSnapshotChange(it.copy(materializedDir = snapshot.materializedDir)); scope.launch { snackbarHost.showSnackbar("配置已导入；点击保存写入当前工作区") }; showImportDialog = false }
                 ?: scope.launch { snackbarHost.showSnackbar("解析失败") }
             }) { Text("导入") } },
             dismissButton = { TextButton(onClick = { showImportDialog = false }) { Text("取消") } }
@@ -654,182 +632,210 @@ fun AiConfigEditor(
     }
 }
 
-// ─── Helper: switch/update provider in config ──────────────────────────────────
-
-private fun switchProvider(snapshot: PiConfigSnapshot, parsed: ParsedConfig, preset: ProviderPreset, onSnapshotChange: (PiConfigSnapshot) -> Unit) {
-    val existing = parsed.providers.firstOrNull { it.id == preset.id }
-    if (existing != null) {
-        onSnapshotChange(snapshot.copy(defaultProvider = preset.id, defaultModel = existing.models.firstOrNull()?.id ?: ""))
-    } else {
-        // 新增 provider
-        val newProvider = ProviderConfig(preset.id, preset.displayName, preset.baseUrl, preset.envKey, preset.color, "", emptyList())
-        val newProviders = parsed.providers + newProvider
-        val newJson = buildModelsJson(newProviders)
-        onSnapshotChange(snapshot.copy(
-            modelsText = newJson, envText = rebuildEnv(parsed.env, newProviders),
-            defaultProvider = preset.id, defaultModel = "",
-            modelCatalog = parseAgentModelCatalog(newJson)
-        ))
+@Composable
+private fun ModelReasoningControl(checked: Boolean, onCheckedChange: (Boolean) -> Unit, enabled: Boolean = true) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        Column(Modifier.weight(1f)) {
+            Text("支持思考/推理", style = MaterialTheme.typography.bodyMedium)
+            Text("仅在模型实际支持时开启。保存配置后重新启动 PI 生效；不会为模型添加推理能力。",
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Switch(checked = checked, onCheckedChange = onCheckedChange, enabled = enabled)
     }
 }
 
+@Composable
+private fun CustomProviderDialog(
+    existingIds: Set<String>,
+    onDismiss: () -> Unit,
+    onCreate: (ProviderConfig) -> Unit
+) {
+    var providerId by remember { mutableStateOf("") }
+    var displayName by remember { mutableStateOf("") }
+    var baseUrl by remember { mutableStateOf("") }
+    var api by remember { mutableStateOf("openai-completions") }
+    var apiKey by remember { mutableStateOf("") }
+    var modelId by remember { mutableStateOf("") }
+    var modelReasoning by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("新建自定义 Provider") },
+        text = {
+            Column(
+                Modifier.fillMaxWidth().heightIn(max = 400.dp).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                OutlinedTextField(
+                    value = providerId, onValueChange = { providerId = it; error = null },
+                    label = { Text("Provider ID") },
+                    supportingText = { Text("唯一标识，不可与已有 Provider 或内置预设重复") },
+                    singleLine = true, modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = displayName, onValueChange = { displayName = it; error = null },
+                    label = { Text("显示名称（可选，默认为 ID）") },
+                    singleLine = true, modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = baseUrl, onValueChange = { baseUrl = it; error = null },
+                    label = { Text("Base URL") },
+                    leadingIcon = { Icon(Icons.Rounded.Public, contentDescription = null) },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Next),
+                    singleLine = true, modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = api, onValueChange = { api = it; error = null },
+                    label = { Text("API Type") },
+                    supportingText = { Text("openai-completions / openai-responses / anthropic-messages / google-generative-ai") },
+                    singleLine = true, modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = apiKey, onValueChange = { apiKey = it; error = null },
+                    label = { Text("API Key") },
+                    leadingIcon = { Icon(Icons.Rounded.Key, contentDescription = null) },
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = ImeAction.Next),
+                    singleLine = true, modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = modelId, onValueChange = { modelId = it; error = null },
+                    label = { Text("Model ID") },
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                    singleLine = true, modifier = Modifier.fillMaxWidth()
+                )
+                ModelReasoningControl(checked = modelReasoning, onCheckedChange = { modelReasoning = it })
+                error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                val id = providerId.trim()
+                val url = baseUrl.trim()
+                error = when {
+                    id.isBlank() -> "Provider ID 不能为空"
+                    id in existingIds -> "Provider ID 已存在，请使用其他 ID"
+                    !isValidProviderBaseUrl(url) -> "Base URL 必须是有效的 HTTP(S) 地址，且不含凭据、查询参数或片段"
+                    api.isBlank() -> "API Type 不能为空"
+                    apiKey.isBlank() -> "API Key 不能为空"
+                    modelId.isBlank() -> "Model ID 不能为空"
+                    else -> null
+                }
+                if (error == null) {
+                    val name = displayName.takeIf { it.isNotBlank() } ?: id
+                    val model = modelId.trim()
+                    onCreate(ProviderConfig(
+                        id = id, displayName = name, baseUrl = url,
+                        envKey = "", color = Color(0xFF6B7280), apiKey = apiKey,
+                        models = listOf(ModelConfig(model, id, model, JsonObject(customPiModel(model) + ("reasoning" to JsonPrimitive(modelReasoning))))),
+                        api = api.trim(), raw = JsonObject(mapOf("displayName" to JsonPrimitive(name)))
+                    ))
+                }
+            }) { Text("创建并选择") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } }
+    )
+}
+
+private fun isValidProviderBaseUrl(value: String): Boolean = runCatching {
+    val uri = URI(value)
+    (uri.scheme.equals("https", ignoreCase = true) || uri.scheme.equals("http", ignoreCase = true)) &&
+        !uri.host.isNullOrBlank() && uri.rawUserInfo == null && uri.rawQuery == null && uri.rawFragment == null &&
+        (uri.port == -1 || uri.port in 1..65535)
+}.getOrDefault(false)
+
+// ─── Helper: switch/update provider in config ──────────────────────────────────
+
+private fun switchProvider(snapshot: PiConfigSnapshot, parsed: ParsedConfig, preset: ProviderPreset, onSnapshotChange: (PiConfigSnapshot) -> Unit) {
+    val selected = parsed.providers.firstOrNull { it.id == preset.id }
+        ?: ProviderConfig(preset.id, preset.displayName, preset.baseUrl, "", preset.color, "", emptyList())
+    selectProvider(snapshot, parsed, selected, onSnapshotChange)
+}
+
+private fun selectProvider(snapshot: PiConfigSnapshot, parsed: ParsedConfig, provider: ProviderConfig, onSnapshotChange: (PiConfigSnapshot) -> Unit) {
+    if (parsed.parseError != null) return
+    val previousModel = snapshot.defaultModel.trim()
+    // Keep the last selected model first without replacing its existing metadata.
+    var providers = parsed.providers.map { previous ->
+        if (previous.id == snapshot.defaultProvider && previousModel.isNotBlank()) {
+            val model = previous.models.firstOrNull { it.id == previousModel }
+                ?: ModelConfig(previousModel, previous.id, previousModel)
+            previous.copy(models = listOf(model) + previous.models.filterNot { it.id == previousModel })
+        } else previous
+    }
+    val selected = providers.firstOrNull { it.id == provider.id } ?: provider.also { providers = providers + it }
+    val json = buildModelsJson(providers, parsed.root)
+    onSnapshotChange(snapshot.copy(modelsText = json, envText = rebuildEnv(parsed.env, providers), defaultProvider = selected.id,
+        defaultModel = if (snapshot.defaultProvider == selected.id) snapshot.defaultModel else selected.models.firstOrNull()?.id.orEmpty(), modelCatalog = parseAgentModelCatalog(json)))
+}
+
 private fun updateProvider(snapshot: PiConfigSnapshot, parsed: ParsedConfig, updated: ProviderConfig, onSnapshotChange: (PiConfigSnapshot) -> Unit) {
-    val newProviders = if (parsed.providers.any { it.id == updated.id }) parsed.providers.map { if (it.id == updated.id) updated else it } else listOf(updated)
-    val newJson = buildModelsJson(newProviders)
-    onSnapshotChange(snapshot.copy(
-        modelsText = newJson, envText = rebuildEnv(parsed.env, newProviders),
-        defaultProvider = updated.id, modelCatalog = parseAgentModelCatalog(newJson)
-    ))
+    if (parsed.parseError != null) return
+    val providers = if (parsed.providers.any { it.id == updated.id }) parsed.providers.map { if (it.id == updated.id) updated else it } else parsed.providers + updated
+    val json = buildModelsJson(providers, parsed.root)
+    onSnapshotChange(snapshot.copy(modelsText = json, envText = rebuildEnv(parsed.env, providers), defaultProvider = updated.id, modelCatalog = parseAgentModelCatalog(json)))
+}
+
+private fun selectModel(snapshot: PiConfigSnapshot, parsed: ParsedConfig, provider: ProviderConfig, model: String, onChange: (PiConfigSnapshot) -> Unit) {
+    val id = model.trim()
+    val updated = if (provider.models.any { it.id == id }) provider else provider.copy(models = provider.models + ModelConfig(id, provider.id, id))
+    updateProvider(snapshot.copy(defaultModel = id), parsed, updated, onChange)
 }
 
 // ─── Connection testing ────────────────────────────────────────────────────────
 
 private fun testProviderConnection(provider: ProviderConfig): TestResult {
+    val secrets = buildList {
+        if (provider.apiKey.isNotBlank()) add(provider.apiKey)
+        (provider.raw["headers"] as? JsonObject)?.values?.forEach { (it as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }?.let(::add) }
+    }
+    fun safe(message: String): String = secrets.fold(message) { text, secret -> text.replace(secret, "[redacted]") }
+        .replace(Regex("(?i)(bearer\\s+)[^\\s,;]+"), "$1[redacted]")
     return try {
-        when (provider.id) {
-            "anthropic" -> testAnthropic(provider)
-            "google" -> testGemini(provider)
-            else -> testOpenAiStyle(provider)
+        require(!provider.apiKey.startsWith("!")) { "命令式凭据请在 PI 中验证；手机测试不会执行命令" }
+        parsePiModels(buildModelsJson(listOf(provider), JsonObject(emptyMap())))
+        require(provider.baseUrl.isNotBlank()) { "Base URL 为空" }
+        val base = provider.baseUrl.trim().trimEnd('/')
+        val url = when (provider.api) {
+            "openai-completions", "openai-responses" -> "$base/models"
+            "anthropic-messages" -> if (base.endsWith("/v1")) "$base/models" else "$base/v1/models"
+            "google-generative-ai" -> "$base/models"
+            else -> error("手机测试不支持此 API Type；配置仍可保存供 PI 使用")
         }
-    } catch (e: java.net.UnknownHostException) { TestResult(false, -1, "无法解析主机名: ${e.message}") }
-    catch (e: java.net.SocketTimeoutException) { TestResult(false, -1, "连接超时") }
-    catch (e: Exception) { TestResult(false, -1, e.message ?: "未知错误") }
-}
-
-private fun testOpenAiStyle(provider: ProviderConfig): TestResult {
-    val base = provider.baseUrl.trim().removeSuffix("/")
-    val modelsUrl = when {
-        base.contains("/chat/completions") -> base.removeSuffix("/chat/completions") + "/models"
-        base.endsWith("/v1") -> base + "/models"
-        base.contains("/v1/") -> base.substringBefore("/v1/") + "/v1/models"
-        else -> base + "/v1/models"
-    }
-    val conn = (java.net.URL(modelsUrl).openConnection() as java.net.HttpURLConnection).apply {
-        requestMethod = "GET"; connectTimeout = 10_000; readTimeout = 15_000
-        setRequestProperty("Authorization", "Bearer ${provider.apiKey}")
-    }
-    try {
-        val code = conn.responseCode; val body = readBody(conn, code)
-        return if (code in 200..299) TestResult(true, code, "连接成功", parseModels(body))
-        else TestResult(false, code, parseError(body) ?: "HTTP $code")
-    } finally {
-        conn.disconnect()
-    }
-}
-
-private fun testAnthropic(provider: ProviderConfig): TestResult {
-    val base = provider.baseUrl.trim().removeSuffix("/")
-    val url = if (base.endsWith("/v1")) "$base/messages" else "$base/v1/messages"
-    val body = """{"model":"claude-3-5-haiku-20241022","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"""
-    val conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
-        requestMethod = "POST"; connectTimeout = 10_000; readTimeout = 15_000; doOutput = true
-        setRequestProperty("x-api-key", provider.apiKey); setRequestProperty("anthropic-version", "2023-06-01")
-        setRequestProperty("Content-Type", "application/json")
-    }
-    try {
-        conn.outputStream.use { it.write(body.toByteArray()) }
-        val code = conn.responseCode; val resp = readBody(conn, code)
-        return when {
-            code in 200..299 -> TestResult(true, code, "连接成功")
-            code == 400 -> TestResult(true, code, "连接成功（Key 有效，模型可能需要更新）")
-            code == 401 || code == 403 -> TestResult(false, code, "API Key 无效")
-            else -> TestResult(false, code, parseError(resp) ?: "HTTP $code")
+        val conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
+            requestMethod = "GET"; connectTimeout = 10_000; readTimeout = 15_000
+            instanceFollowRedirects = false
+            if (provider.apiKey.isNotBlank()) when (provider.api) {
+                "anthropic-messages" -> setRequestProperty("x-api-key", provider.apiKey)
+                "google-generative-ai" -> setRequestProperty("x-goog-api-key", provider.apiKey)
+                else -> setRequestProperty("Authorization", "Bearer ${provider.apiKey}")
+            }
+            if (provider.api == "anthropic-messages") setRequestProperty("anthropic-version", "2023-06-01")
+            if ((provider.raw["authHeader"] as? JsonPrimitive)?.contentOrNull == "true" && provider.apiKey.isNotBlank()) setRequestProperty("Authorization", "Bearer ${provider.apiKey}")
+            (provider.raw["headers"] as? JsonObject)?.forEach { (name, value) -> setRequestProperty(name, value.jsonPrimitive.content) }
         }
-    } finally {
-        conn.disconnect()
-    }
-}
-
-private fun testGemini(provider: ProviderConfig): TestResult {
-    val base = provider.baseUrl.trim().removeSuffix("/")
-    val url = if (base.contains("/v1beta")) "$base/models?key=${provider.apiKey}" else "$base/v1beta/models?key=${provider.apiKey}"
-    val conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply { requestMethod = "GET"; connectTimeout = 10_000; readTimeout = 15_000 }
-    try {
-        val code = conn.responseCode; val body = readBody(conn, code)
-        return if (code in 200..299) TestResult(true, code, "连接成功", parseGeminiModels(body))
-        else TestResult(false, code, parseError(body) ?: "HTTP $code")
-    } finally {
-        conn.disconnect()
-    }
-}
-
-private fun readBody(conn: java.net.HttpURLConnection, code: Int): String =
-    if (code in 200..299) conn.inputStream?.bufferedReader()?.use { it.readText() } ?: ""
-    else conn.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
-
-private fun parseModels(body: String): List<String> = try {
-    val obj = Json.parseToJsonElement(body) as? JsonObject ?: return emptyList()
-    (obj["data"] as? JsonArray)?.mapNotNull { (it as? JsonObject)?.get("id")?.jsonPrimitive?.contentOrNull }?.filter { it.isNotBlank() } ?: emptyList()
-} catch (e: Exception) {
-    android.util.Log.w("AiConfigEditor", "parseModels 失败: ${e.message}")
-    emptyList()
-}
-
-private fun parseGeminiModels(body: String): List<String> = try {
-    val obj = Json.parseToJsonElement(body) as? JsonObject ?: return emptyList()
-    (obj["models"] as? JsonArray)?.mapNotNull { (it as? JsonObject)?.get("name")?.jsonPrimitive?.contentOrNull?.removePrefix("models/") }?.filter { it.isNotBlank() } ?: emptyList()
-} catch (e: Exception) {
-    android.util.Log.w("AiConfigEditor", "parseGeminiModels 失败: ${e.message}")
-    emptyList()
-}
-
-private fun parseError(body: String): String? = try {
-    val obj = Json.parseToJsonElement(body) as? JsonObject
-    obj?.get("error")?.let { (it as? JsonObject)?.get("message")?.jsonPrimitive?.contentOrNull } ?: obj?.get("message")?.jsonPrimitive?.contentOrNull
-} catch (e: Exception) {
-    android.util.Log.w("AiConfigEditor", "parseError 失败: ${e.message}")
-    null
-}
-
-// ─── Model fetching ────────────────────────────────────────────────────────────
-
-private fun fetchAvailableModels(provider: ProviderConfig): List<String> = try {
-    when (provider.id) {
-        "google" -> fetchGemini(provider)
-        "anthropic" -> fetchAnthropic(provider)
-        else -> fetchOpenAi(provider)
-    }
-} catch (e: Exception) {
-    android.util.Log.w("AiConfigEditor", "fetchAvailableModels 失败: ${e.message}")
-    emptyList()
-}
-
-private fun fetchOpenAi(provider: ProviderConfig): List<String> {
-    val base = provider.baseUrl.trim().removeSuffix("/")
-    val url = when { base.contains("/chat/completions") -> base.removeSuffix("/chat/completions") + "/models"; base.endsWith("/v1") -> base + "/models"; base.contains("/v1/") -> base.substringBefore("/v1/") + "/v1/models"; else -> base + "/v1/models" }
-    val conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply { requestMethod = "GET"; connectTimeout = 10_000; readTimeout = 15_000; setRequestProperty("Authorization", "Bearer ${provider.apiKey}") }
-    try {
-        if (conn.responseCode !in 200..299) return emptyList()
-        val body = conn.inputStream.bufferedReader().use { it.readText() }
-        return parseModels(body)
-    } finally {
-        conn.disconnect()
-    }
-}
-
-private fun fetchAnthropic(provider: ProviderConfig): List<String> {
-    val base = provider.baseUrl.trim().removeSuffix("/").removeSuffix("/v1")
-    val conn = (java.net.URL("$base/v1/models").openConnection() as java.net.HttpURLConnection).apply { requestMethod = "GET"; connectTimeout = 10_000; readTimeout = 15_000; setRequestProperty("x-api-key", provider.apiKey); setRequestProperty("anthropic-version", "2023-06-01") }
-    try {
-        if (conn.responseCode !in 200..299) return emptyList()
-        val body = conn.inputStream.bufferedReader().use { it.readText() }
-        return parseModels(body)
-    } finally {
-        conn.disconnect()
-    }
-}
-
-private fun fetchGemini(provider: ProviderConfig): List<String> {
-    val base = provider.baseUrl.trim().removeSuffix("/")
-    val url = if (base.contains("/v1beta")) "$base/models?key=${provider.apiKey}" else "$base/v1beta/models?key=${provider.apiKey}"
-    val conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply { requestMethod = "GET"; connectTimeout = 10_000; readTimeout = 15_000 }
-    try {
-        if (conn.responseCode !in 200..299) return emptyList()
-        val body = conn.inputStream.bufferedReader().use { it.readText() }
-        return parseGeminiModels(body)
-    } finally {
-        conn.disconnect()
-    }
+        try {
+            val code = conn.responseCode
+            val body = (if (code in 200..299) conn.inputStream else conn.errorStream)?.bufferedReader()?.use { it.readText() }.orEmpty()
+            val obj = runCatching { Json.parseToJsonElement(body) as? JsonObject }.getOrNull()
+            val error = (obj?.get("error") as? JsonObject)?.get("message") as? JsonPrimitive
+                ?: obj?.get("message") as? JsonPrimitive
+            if (code !in 200..299) TestResult(false, code, safe("HTTP $code: ${error?.contentOrNull ?: conn.responseMessage.orEmpty()}"))
+            else {
+                val list = obj?.get(if (provider.api == "google-generative-ai") "models" else "data") as? JsonArray
+                if (list == null || obj?.get("error") != null) TestResult(false, code, "响应不是有效的模型列表")
+                else {
+                    val field = if (provider.api == "google-generative-ai") "name" else "id"
+                    val models = list.mapNotNull { (it as? JsonObject)?.get(field)?.let { it as? JsonPrimitive }?.contentOrNull?.removePrefix("models/")?.takeIf { it.isNotBlank() } }.distinct()
+                    if (models.size != list.size) TestResult(false, code, "模型列表含无效或重复的模型 ID")
+                    else TestResult(true, code, "模型端点连接成功", models)
+                }
+            }
+        } finally { conn.disconnect() }
+    } catch (_: java.net.UnknownHostException) { TestResult(false, -1, "无法解析主机名") }
+    catch (_: java.net.SocketTimeoutException) { TestResult(false, -1, "连接超时") }
+    catch (e: Exception) { TestResult(false, -1, safe(e.message ?: "未知连接错误")) }
 }
 
 // ─── Config export / import ────────────────────────────────────────────────────
@@ -847,6 +853,11 @@ private fun exportConfig(snapshot: PiConfigSnapshot): String {
 
 private fun parseImportedConfig(json: String): PiConfigSnapshot? = try {
     val export = Json { ignoreUnknownKeys = true }.decodeFromString(ConfigExport.serializer(), json)
+    parsePiModels(export.modelsText)
+    val parsed = parseConfig(export.modelsText, export.envText)
+    require(parsed.parseError == null && parsed.env.keys.all { Regex("[A-Za-z_][A-Za-z0-9_]*").matches(it) })
+    require(export.defaultProvider.isBlank() == export.defaultModel.isBlank())
+    require(Json.parseToJsonElement(export.settingsText.ifBlank { "{}" }) is JsonObject)
     PiConfigSnapshot(
         defaultProvider = export.defaultProvider, defaultModel = export.defaultModel,
         defaultThinkingLevel = export.defaultThinkingLevel.ifBlank { "medium" },
@@ -856,6 +867,6 @@ private fun parseImportedConfig(json: String): PiConfigSnapshot? = try {
         modelCatalog = parseAgentModelCatalog(export.modelsText.ifBlank { "{}" })
     )
 } catch (e: Exception) {
-    android.util.Log.w("AiConfigEditor", "导入配置解析失败: ${e.message}")
+    // Never log imported JSON or parser exceptions, which may contain credentials.
     null
 }

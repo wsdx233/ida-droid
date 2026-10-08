@@ -158,6 +158,12 @@ fun AgentScreen(
                 if (session == null) {
                     Box(Modifier.weight(1f).fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                            agentState.error?.takeIf(String::isNotBlank)?.let { error ->
+                                AgentErrorCard(error, hasSession = false,
+                                    onRetry = { manager.refresh(createDefaultIfReady = true) },
+                                    onDetails = { detail = error })
+                                OutlinedButton(onClick = { panel = AgentPanel.Workspace }) { Text("选择容器工作区") }
+                            }
                             Text("开始一项新任务", style = MaterialTheme.typography.headlineSmall)
                             Text("会话、文件与工具都留在你的设备上。", color = MaterialTheme.colorScheme.onSurfaceVariant)
                             Button(onClick = { manager.createSession() }) { Text("新建 Session") }
@@ -187,7 +193,7 @@ fun AgentScreen(
                                         }
                                     }
                                     agentState.error?.takeIf(String::isNotBlank)?.let { error ->
-                                        AgentErrorCard(error, onRetry = { manager.startSession(session.id); manager.loadMessages() }, onDetails = { detail = listOf(error, agentState.stderrTail).filter(String::isNotBlank).joinToString("\n\n") })
+                                        AgentErrorCard(error, hasSession = true, onRetry = { manager.startSession(session.id); manager.loadMessages() }, onDetails = { detail = listOf(error, agentState.stderrTail).filter(String::isNotBlank).joinToString("\n\n") })
                                     }
                                     if (!agentState.messagesLoading && agentState.messages.isEmpty()) AgentWelcome { insertText(it) }
                                 }
@@ -236,7 +242,15 @@ fun AgentScreen(
             }
             AgentPanel.Configuration -> AgentFullPanel("Agent 配置", onClose = { panel = null }) { PiSettingsTab(agentState, manager) }
             AgentPanel.Workspace -> AgentFullPanel("工作区", onClose = { panel = null }) {
-                WorkspaceSidePane(agentState, manager, onClose = { panel = null }, onInsertComposer = { insertText(it); panel = null })
+                WorkspaceSidePane(
+                    agentState, manager,
+                    onClose = { panel = null },
+                    onInsertComposer = { insertText(it); panel = null },
+                    onAttach = { attachment ->
+                        val target = sessionId ?: error("请先创建或选择会话")
+                        store.attach(target, attachment)
+                    }
+                )
             }
             AgentPanel.Search -> SearchMessagesSheet(agentState.messages, onDismiss = { panel = null }, onJump = { message ->
                 panel = null
@@ -288,7 +302,7 @@ private fun AgentTopBar(session: AgentSessionRecord?, state: AgentUiState, onSes
             IconButton(onClick = { menu = true }) { Icon(Icons.Rounded.MoreVert, "会话操作") }
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                 DropdownMenuItem(text = { Text("搜索消息") }, onClick = { menu = false; onSearch() })
-                DropdownMenuItem(text = { Text("工作区 · ${state.workspace.workspaceName.ifBlank { "选择文件夹" }}") }, onClick = { menu = false; onWorkspace() })
+                DropdownMenuItem(text = { Text("工作区 · ${state.workspace.workspaceName.ifBlank { "选择容器目录" }}") }, onClick = { menu = false; onWorkspace() })
                 DropdownMenuItem(text = { Text("Terminal / Files / IDA") }, onClick = { menu = false; onTools() })
                 DropdownMenuItem(text = { Text("Agent 配置") }, onClick = { menu = false; onConfigure() })
                 DropdownMenuItem(text = { Text("刷新会话") }, onClick = { menu = false; onRefresh() })
@@ -346,12 +360,12 @@ private fun AgentWelcome(onPrompt: (String) -> Unit) {
 }
 
 @Composable
-private fun AgentErrorCard(error: String, onRetry: () -> Unit, onDetails: () -> Unit) {
+private fun AgentErrorCard(error: String, hasSession: Boolean, onRetry: () -> Unit, onDetails: () -> Unit) {
     Surface(color = MaterialTheme.colorScheme.errorContainer, shape = MaterialTheme.shapes.medium) {
         Column(Modifier.fillMaxWidth().padding(16.dp)) {
             Text(error, color = MaterialTheme.colorScheme.onErrorContainer, maxLines = 5, overflow = TextOverflow.Ellipsis)
-            Row { TextButton(onClick = onRetry) { Text("重新连接") }; TextButton(onClick = onDetails) { Text("查看诊断") } }
-            Text("可在输入栏编辑并重新发送；不会自动重复执行任务。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onErrorContainer)
+            Row { TextButton(onClick = onRetry) { Text(if (hasSession) "重新连接" else "刷新配置") }; TextButton(onClick = onDetails) { Text("查看诊断") } }
+            if (hasSession) Text("可在输入栏编辑并重新发送；不会自动重复执行任务。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onErrorContainer)
         }
     }
 }

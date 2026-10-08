@@ -209,7 +209,8 @@ class IdaDroidSettings(context: Context) {
     }
 
     fun updateWorkspacePath(path: String) {
-        prefs.edit { putString(KEY_WORKSPACE_PATH, sanitizeSingleLine(path).ifBlank { DEFAULT_WORKSPACE_PATH }) }
+        prefs.edit { putString(KEY_WORKSPACE_PATH, normalizeWorkspacePath(path)) }
+        _envSettings.value = readEnvSettings()
     }
 
     fun resetEnvDefaults() {
@@ -378,6 +379,22 @@ class IdaDroidSettings(context: Context) {
         // Environment defaults
         const val DEFAULT_IDA_HOME = "/root/ida-pro-9.3"
         const val DEFAULT_WORKSPACE_PATH = "/root/pi_workspace"
+
+        /** Workspace paths refer only to real rootfs directories, never runtime bind mounts. */
+        fun normalizeWorkspacePath(path: String): String {
+            val raw = path.trim()
+            require(raw.startsWith('/')) { "工作区必须是容器内绝对路径" }
+            require(raw.none { it.isISOControl() } && '\\' !in raw) { "工作区路径含无效字符" }
+            val parts = raw.split('/').filter { it.isNotEmpty() && it != "." }
+            require(".." !in parts) { "工作区路径不能包含 .." }
+            val normalized = "/${parts.joinToString("/")}"
+            require(WORKSPACE_BIND_PATHS.none { normalized == it || normalized.startsWith("$it/") }) {
+                "工作区必须位于容器 rootfs 内，不能使用外部绑定目录"
+            }
+            return normalized
+        }
+
+        private val WORKSPACE_BIND_PATHS = listOf("/sdcard", "/storage", "/mnt", "/dev", "/proc", "/sys", "/system", "/apex", "/host", "/tmp", "/var/tmp")
 
         // Default VNC password (legacy, kept for reference; new installs get random)
         val DEFAULT_VNC_PASSWORD: String = LEGACY_VNC_PASSWORD

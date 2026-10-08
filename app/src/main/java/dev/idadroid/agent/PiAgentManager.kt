@@ -10,6 +10,11 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import dev.idadroid.util.runCatchingSuspend
@@ -23,16 +28,18 @@ class PiAgentManager(
 ) : java.io.Closeable {
     private val appContext = context.applicationContext
     private val settings = dev.idadroid.settings.IdaDroidSettings(appContext)
+    private val containerFiles = dev.idadroid.files.ContainerFileManager(appContext, paths)
     private val workspaceProotPath get() = settings.envSettings.value.workspacePath.ifBlank { dev.idadroid.settings.IdaDroidSettings.DEFAULT_WORKSPACE_PATH }
-    private val workspaceHostRoot get() = guestFile(workspaceProotPath)
+    private val workspaceHostRoot get() = containerFiles.rootfsFile(workspaceProotPath)
     private val repo = AgentSessionRepository(appContext, paths)
     private val configManager = PiConfigManager(appContext, paths)
-    val aiConfigTools = AiConfigTools(paths, configManager)
     private val attachmentManager = AttachmentManager(appContext, paths)
     val workspaceManager = WorkspaceManager(appContext, paths)
     private val deepIndexToolChain = dev.idadroid.deepindex.DeepIndexToolChain(appContext, paths)
     private val runtime = IdaProotRuntime(appContext, paths)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    // Workspace observation must survive disconnect(), which cancels PI operations.
+    private val workspaceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val operations = Mutex()
     private val json = Json { ignoreUnknownKeys = true }
     private val _state = MutableStateFlow(AgentUiState(activity = "PI 未启动"))
@@ -51,6 +58,21 @@ class PiAgentManager(
     private var streamingId: String? = null
     private var streamingBase = emptyList<ChatMessage>()
     private var closed = false
+    private var workspaceListing: Job? = null
+    private var workspaceListingRevision = 0L
+
+    init {
+        workspaceScope.launch {
+            settings.envSettings.map { it.workspacePath.ifBlank { dev.idadroid.settings.IdaDroidSettings.DEFAULT_WORKSPACE_PATH } }
+                .distinctUntilChanged().drop(1).collect { path ->
+                    disconnect()
+                    _state.value = AgentUiState(activity = "工作区已切换，正在读取配置与会话",
+                        workspace = WorkspaceState(workspacePath = path))
+                    refresh()
+                    refreshWorkspaceFiles("")
+                }
+        }
+    }
 
     private fun publishQueue() {
         _state.update { it.copy(activeQueue = QueueState(
@@ -59,7 +81,7 @@ class PiAgentManager(
     }
 
     /** Application-owned: never close on screen/activity recreation. */
-    override fun close() { closed = true; disconnect(); scope.cancel() }
+    override fun close() { closed = true; disconnect(); scope.cancel(); workspaceScope.cancel() }
 
     private fun disconnect() {
         generation++
@@ -98,12 +120,13 @@ class PiAgentManager(
             if (createDefaultIfReady && repo.listSessions().isEmpty()) createDefaultSessionWithConfiguredModel()
             repo.loadStore()
         }
+        val hasWorkspace = withContext(Dispatchers.IO) { workspaceManager.hasWorkspace }
         val active = _state.value.activeSessionId?.takeIf { id -> store.sessions.any { it.id == id } }
             ?: store.activeSessionId ?: store.sessions.firstOrNull()?.id
         _state.update { old -> old.copy(sessions = store.sessions, activeSessionId = active, piConfig = snapshot,
             modelLabel = modelLabel(store.sessions.firstOrNull { it.id == active }),
-            workspace = old.workspace.copy(hasWorkspace = workspaceManager.hasWorkspace,
-                workspaceName = workspaceManager.currentWorkspaceName, workspaceUri = workspaceManager.currentWorkspaceUri?.toString().orEmpty())) }
+            workspace = old.workspace.copy(hasWorkspace = hasWorkspace,
+                workspaceName = workspaceManager.currentWorkspaceName, workspacePath = workspaceManager.currentWorkspacePath)) }
         if (active != null && !_state.value.turnActive && boundSession == null) readMessages(active)
     }
 
@@ -117,6 +140,8 @@ class PiAgentManager(
                 repo.createSession(name, model?.provider, model?.id, cfg.defaultThinkingLevel)
             }
             _state.update { it.copy(activeSessionId = session.id, activeStats = null) }
+            // A failed PI startup must not hide the session already saved on disk.
+            publishSessions()
             readMessages(session.id)
         }
     }
@@ -266,45 +291,60 @@ class PiAgentManager(
 
     // ==================== 工作区相关 ====================
 
-    /** 设置工作区 URI（由 SAF 选择回调传入）。 */
-    fun setWorkspace(uri: android.net.Uri) {
-        scope.launch {
-            runCatching {
-                workspaceManager.setWorkspace(uri)
-                _state.update { it.copy(workspace = it.workspace.copy(
-                    hasWorkspace = true,
-                    workspaceName = workspaceManager.currentWorkspaceName,
-                    workspaceUri = uri.toString(),
-                    currentPath = "",
-                    error = null
-                )) }
-                refreshWorkspaceFiles()
-            }.onFailure { error -> setError("设置工作区失败：${error.message}") }
+    /** Select the same container directory used by PI, sessions and attachments. */
+    fun setWorkspace(path: String, create: Boolean = false, onResult: (Boolean, String) -> Unit = { _, _ -> }) {
+        workspaceScope.launch {
+            try {
+                val selected = operations.withLock {
+                    check(!closed) { "Agent 已关闭" }
+                    check(!_state.value.turnActive && _state.value.status != "starting") { "请先停止当前任务再切换工作区" }
+                    val previous = workspaceProotPath
+                    val next = workspaceManager.setWorkspace(path, create)
+                    if (next == previous) {
+                        refresh()
+                        refreshWorkspaceFiles("")
+                    }
+                    next
+                }
+                val loaded = _state.first { state ->
+                    state.workspace.workspacePath == selected &&
+                        ((state.piConfig.materializedDir.isNotBlank() && !state.workspace.loading) ||
+                            state.workspace.error != null ||
+                            (state.status == "error" && state.piConfig.materializedDir.isBlank()))
+                }
+                check(loaded.workspace.error == null) { loaded.workspace.error.orEmpty() }
+                check(loaded.piConfig.materializedDir.isNotBlank()) { loaded.error ?: "无法读取工作区配置" }
+                onResult(true, selected)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                val message = "设置工作区失败：${error.message.orEmpty()}"
+                _state.update { it.copy(workspace = it.workspace.copy(error = message)) }
+                onResult(false, message)
+            }
         }
     }
 
-    /** 清除当前工作区。 */
-    fun clearWorkspace() {
-        workspaceManager.clearWorkspace()
-        _state.update { it.copy(workspace = WorkspaceState()) }
-    }
+    fun resetWorkspace() = setWorkspace(dev.idadroid.settings.IdaDroidSettings.DEFAULT_WORKSPACE_PATH, create = true)
 
-    /** 刷新工作区文件列表。 */
+    /** Only the newest request may publish its directory listing. */
     fun refreshWorkspaceFiles(path: String = _state.value.workspace.currentPath) {
-        scope.launch {
+        workspaceListing?.cancel()
+        val revision = ++workspaceListingRevision
+        val root = workspaceProotPath
+        workspaceListing = workspaceScope.launch {
             _state.update { it.copy(workspace = it.workspace.copy(loading = true, error = null)) }
             try {
-                val files = withContext(Dispatchers.IO) { workspaceManager.listFiles(path) }
-                _state.update { it.copy(workspace = it.workspace.copy(
-                    files = files,
-                    currentPath = path,
-                    loading = false
-                )) }
+                val files = workspaceManager.listFiles(path)
+                if (root != workspaceProotPath || revision != workspaceListingRevision) return@launch
+                _state.update { it.copy(workspace = it.workspace.copy(files = files, currentPath = path, loading = false)) }
+            } catch (error: CancellationException) {
+                throw error
             } catch (error: Exception) {
-                _state.update { it.copy(workspace = it.workspace.copy(
-                    loading = false,
-                    error = "读取工作区失败：${error.message}"
-                )) }
+                if (root == workspaceProotPath && revision == workspaceListingRevision) {
+                    _state.update { it.copy(workspace = it.workspace.copy(loading = false,
+                        error = "读取工作区失败：${error.message.orEmpty()}")) }
+                }
             }
         }
     }
@@ -315,47 +355,9 @@ class PiAgentManager(
         refreshWorkspaceFiles(next)
     }
 
-    /** 将工作区中的文件导入到 pi_workspace 容器内，供 Agent 使用。 */
-    fun importWorkspaceFileToContainer(entry: WorkspaceFileEntry, onResult: (Boolean, String) -> Unit = { _, _ -> }) {
-        scope.launch {
-            runCatchingSuspend {
-                withContext(Dispatchers.IO) { workspaceManager.importToContainer(entry) }
-            }.onSuccess { prootPath ->
-                val path = prootPath ?: "未知路径"
-                appendMessage(ChatMessage(newMessageId(), "system", "已从工作区导入文件：${entry.name} → $path", System.currentTimeMillis()))
-                onResult(true, path)
-            }.onFailure { error ->
-                setError("导入工作区文件失败：${error.message}")
-                onResult(false, error.message ?: "未知错误")
-            }
-        }
-    }
-
-    /** 将 pi_workspace 容器内的文件导出到工作区。 */
-    fun exportFileToWorkspace(containerRelativePath: String, onResult: (Boolean, String) -> Unit = { _, _ -> }) {
-        scope.launch {
-            runCatchingSuspend {
-                withContext(Dispatchers.IO) { workspaceManager.exportFromContainer(containerRelativePath) }
-            }.onSuccess { name ->
-                val fileName = name ?: containerRelativePath.substringAfterLast('/').ifBlank { containerRelativePath }
-                appendMessage(ChatMessage(newMessageId(), "system", "已导出到工作区：$containerRelativePath → $fileName", System.currentTimeMillis()))
-                refreshWorkspaceFiles()
-                onResult(true, fileName)
-            }.onFailure { error ->
-                setError("导出到工作区失败：${error.message}")
-                onResult(false, error.message ?: "未知错误")
-            }
-        }
-    }
-
     /** 读取工作区文件作为草稿附件（用于发送给 Agent）。 */
-    suspend fun readWorkspaceFileAsAttachment(entry: WorkspaceFileEntry): DraftAttachment? {
-        return runCatchingSuspend {
-            withContext(Dispatchers.IO) { workspaceManager.readAsDraftAttachment(entry) }
-        }.onFailure { error ->
-            setError("读取工作区文件失败：${error.message}")
-        }.getOrNull()
-    }
+    suspend fun readWorkspaceFileAsAttachment(entry: WorkspaceFileEntry): DraftAttachment =
+        workspaceManager.readAsDraftAttachment(entry)
 
     /** 将指定助手回复保存为工作区文件（满足"生成的代码文件都放工作区"）。 */
     fun saveAssistantMessageToWorkspace(messageId: String, fileName: String, onResult: (Boolean, String) -> Unit = { _, _ -> }) {
@@ -391,13 +393,7 @@ class PiAgentManager(
     }
 
     /** 将工作区文件内容作为文本引用插入到输入框。 */
-    suspend fun readWorkspaceFileAsText(entry: WorkspaceFileEntry): String? {
-        return runCatchingSuspend {
-            withContext(Dispatchers.IO) { workspaceManager.readAsText(entry) }
-        }.onFailure { error ->
-            setError("读取工作区文件失败：${error.message}")
-        }.getOrNull()
-    }
+    suspend fun readWorkspaceFileAsText(entry: WorkspaceFileEntry): String = workspaceManager.readAsText(entry)
 
     suspend fun readDraftAttachment(uri: android.net.Uri): DraftAttachment = attachmentManager.readDraft(uri)
 
@@ -424,11 +420,55 @@ class PiAgentManager(
         setSessionModel(PiModel(id = modelId.trim(), provider = provider.trim()))
     }
 
-    fun chooseThinking(level: String) = operation {
-        val id = _state.value.activeSessionId ?: return@operation
-        val rpc = connection(id)
-        rpc.request("set_thinking_level", fields("level" to level))
-        persistRuntimeState(id, rpc.request("get_state"))
+    fun chooseThinking(level: String, onResult: (Boolean, String) -> Unit = { _, _ -> }) {
+        val id = _state.value.activeSessionId
+        if (id == null) {
+            onResult(false, "请先创建或选择会话")
+            return
+        }
+        val epoch = generation
+        scope.launch {
+            try {
+                operations.withLock {
+                    if (closed || epoch != generation) {
+                        onResult(false, "会话已切换，请重新选择思考强度")
+                        return@withLock
+                    }
+                    val rpc = connection(id)
+                    val before = rpc.request("get_state")
+                    val model = before["model"] as? JsonObject
+                    if (level != "off" && model?.boolean("reasoning") != true) {
+                        persistRuntimeState(id, before)
+                        val message = if (model == null) "PI 未选择模型，请先选择模型再设置思考强度"
+                            else "当前模型未声明支持思考/推理，PI 只能使用 off。若模型实际支持，请在 AI 配置中开启该模型的「支持思考/推理」，保存后重新启动 PI；否则请选择支持推理的模型。"
+                        _state.update { it.copy(error = message, activity = message) }
+                        onResult(false, message)
+                        return@withLock
+                    }
+                    rpc.request("set_thinking_level", fields("level" to level))
+                    val effective = rpc.request("get_state")
+                    val applied = effective.string("thinkingLevel") ?: error("PI 未返回实际思考强度，无法确认设置")
+                    persistRuntimeState(id, effective)
+                    val accepted = applied == level
+                    val message = if (accepted) "思考强度已设置为 $applied"
+                        else "当前模型未接受 $level，PI 实际应用了 $applied。请选择模型支持的强度。"
+                    _state.update { it.copy(error = if (accepted) null else message, activity = message) }
+                    onResult(accepted, message)
+                }
+            } catch (error: CancellationException) {
+                onResult(false, "思考强度设置已中断，未确认应用；请重新连接后查看实际状态")
+                if (epoch == generation && error is TimeoutCancellationException) fail("PI command timed out")
+                else throw error
+            } catch (error: PiRpcCommandException) {
+                val message = configManager.redact(error.message ?: "PI 拒绝设置思考强度")
+                if (epoch == generation) _state.update { it.copy(error = message, activity = message) }
+                onResult(false, message)
+            } catch (error: Exception) {
+                val message = configManager.redact(error.message ?: "思考强度设置失败")
+                if (epoch == generation) fail(message)
+                onResult(false, message)
+            }
+        }
     }
 
     fun setAutoCompaction(enabled: Boolean) = operation {
@@ -471,14 +511,37 @@ class PiAgentManager(
         rpc.request("set_follow_up_mode", fields("mode" to followUp))
     }
 
-    fun getPiConfigSnapshot(): PiConfigSnapshot = configManager.readSnapshot()
+    fun getPiConfigSnapshot(): PiConfigSnapshot = _state.value.piConfig
 
-    fun savePiConfig(snapshot: PiConfigSnapshot) {
-        if (_state.value.turnActive) { _state.update { it.copy(activity = "请先停止当前任务再保存 PI 配置") }; return }
+    suspend fun savePiConfig(snapshot: PiConfigSnapshot): Boolean {
+        if (_state.value.turnActive || _state.value.status == "starting") {
+            _state.update { it.copy(error = "请先停止当前任务再保存 PI 配置", activity = "请先停止当前任务再保存 PI 配置") }
+            return false
+        }
         disconnect()
-        operation {
-            withContext(Dispatchers.IO) { configManager.saveSnapshot(snapshot); configManager.materialize() }
-            _state.update { it.copy(piConfig = configManager.readSnapshot(), sessionModels = emptyList(), status = "idle", activity = "PI 配置已保存，下次启动生效", error = null) }
+        val epoch = generation
+        return operations.withLock {
+            try {
+                check(!closed && epoch == generation) { "工作区或会话已切换，请重新打开配置" }
+                val saved = withContext(Dispatchers.IO) {
+                    val current = configManager.readSnapshot()
+                    require(snapshot.materializedDir.isBlank() || snapshot.materializedDir == current.materializedDir) {
+                        "工作区已切换，请重新打开配置"
+                    }
+                    configManager.saveSnapshot(snapshot)
+                    configManager.materialize()
+                    configManager.readSnapshot()
+                }
+                check(epoch == generation) { "工作区或会话已切换，请重新打开配置" }
+                _state.update { it.copy(piConfig = saved, sessionModels = emptyList(), status = "idle",
+                    activity = "PI 配置已保存，下次启动生效", error = null) }
+                true
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                if (epoch == generation) setError(configManager.redact(error.message ?: "PI 配置保存失败"))
+                false
+            }
         }
     }
 

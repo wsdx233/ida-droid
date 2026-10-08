@@ -18,12 +18,10 @@ class PiConfigManager(
 ) {
     private val appContext = context.applicationContext
     private val settings = dev.idadroid.settings.IdaDroidSettings(appContext)
+    private val containerFiles = dev.idadroid.files.ContainerFileManager(appContext, paths)
     /** 用户设置的工作区路径 (proot 内可见路径) */
     fun workspaceProotPath(): String = settings.envSettings.value.workspacePath.ifBlank { dev.idadroid.settings.IdaDroidSettings.DEFAULT_WORKSPACE_PATH }
-    private val workspace get() = workspaceProotPath().let { path ->
-        if (path == "/sdcard" || path.startsWith("/sdcard/") || path == "/storage" || path.startsWith("/storage/")) File(path)
-        else File(paths.rootfsDir, path.removePrefix("/"))
-    }
+    private val workspace get() = containerFiles.rootfsFile(workspaceProotPath())
     private val idaDroidDir get() = File(workspace, ".idadroid")
     private val agentDir get() = File(idaDroidDir, "pi-agent")
     private val piDir get() = File(workspace, ".pi")
@@ -80,10 +78,12 @@ class PiConfigManager(
     }
 
     fun saveSnapshot(snapshot: PiConfigSnapshot) {
-        agentDir.mkdirs()
-        piDir.mkdirs()
+        // Capture destinations once, and validate every payload before touching originals.
+        val targetWorkspace = workspace
+        val targetAgentDir = File(targetWorkspace, ".idadroid/pi-agent")
+        val targetPiDir = File(targetWorkspace, ".pi")
         parseObject(snapshot.settingsText.ifBlank { "{}" })
-        parseObject(snapshot.modelsText.ifBlank { "{}" })
+        val models = prepareModels(snapshot.modelsText, snapshot.defaultProvider.trim(), snapshot.defaultModel.trim())
         val env = parseEnv(snapshot.envText)
         val config = PiUserConfig(
             defaultProvider = snapshot.defaultProvider.trim().takeIf { it.isNotBlank() },
@@ -93,10 +93,14 @@ class PiConfigManager(
             env = env,
             extraArgs = snapshot.extraArgsText.lines().map { it.trim() }.filter { it.isNotBlank() && !it.startsWith("#") }
         )
-        privateWrite(configFile, JsonFormats.pretty.encodeToString(config))
-        privateWrite(settingsFile, snapshot.settingsText.ifBlank { "{}" }.trimEnd())
-        privateWrite(modelsFile, snapshot.modelsText.ifBlank { "{}" }.trimEnd())
-        privateWrite(appendSystemFile, snapshot.appendSystem.trimEnd())
+        validateRuntimeConfig(config)
+        runtimeModels(models, config) // Conversion must succeed before committing editable originals.
+        check(targetAgentDir.isDirectory || targetAgentDir.mkdirs()) { "Cannot create PI config directory" }
+        check(targetPiDir.isDirectory || targetPiDir.mkdirs()) { "Cannot create PI prompt directory" }
+        privateWrite(File(targetAgentDir, "idadroid-pi-config.json"), JsonFormats.pretty.encodeToString(config))
+        privateWrite(File(targetAgentDir, "settings.json"), snapshot.settingsText.ifBlank { "{}" }.trimEnd())
+        privateWrite(File(targetAgentDir, "models.json"), JsonFormats.pretty.encodeToString(models))
+        privateWrite(File(targetPiDir, "APPEND_SYSTEM.md"), snapshot.appendSystem.trimEnd())
         // 使缓存失效
         cachedSnapshot = null
     }
@@ -109,31 +113,10 @@ class PiConfigManager(
     fun materialize(): String {
         val snapshot = readSnapshot()
         val cfg = readUserConfig()
+        validateRuntimeConfig(cfg)
+        val models = runtimeModels(prepareModels(snapshot.modelsText, cfg.defaultProvider.orEmpty(), cfg.defaultModel.orEmpty()), cfg)
         val runtimeDir = runtimeHostDir.apply { mkdirs() }
-        val models = parseObject(snapshot.modelsText)
-        val providers = models["providers"] as? JsonObject ?: JsonObject(emptyMap())
-        val converted = providers.mapValues { (id, value) ->
-            val provider = (value as? JsonObject ?: error("Invalid PI provider object")).toMutableMap()
-            val legacy = provider.containsKey("baseURL") || provider.containsKey("envKey")
-            provider.remove("baseURL")?.let { if (provider["baseUrl"] == null) provider["baseUrl"] = it }
-            val envKey = provider.remove("envKey")?.jsonPrimitive?.contentOrNull
-            provider.remove("displayName")
-            if (legacy && provider["api"] == null) provider["api"] = JsonPrimitive(when (id) {
-                "anthropic" -> "anthropic-messages"
-                "google" -> "google-generative-ai"
-                else -> "openai-completions"
-            })
-            if (provider["apiKey"] == null && envKey != null) {
-                val key = cfg.env[envKey]?.takeIf { it.isNotBlank() }
-                    ?: error("Missing credential environment variable: $envKey")
-                provider["apiKey"] = JsonPrimitive(key)
-            } else {
-                val key = provider["apiKey"]?.jsonPrimitive?.contentOrNull
-                key?.let { cfg.env[it] }?.let { provider["apiKey"] = JsonPrimitive(it) }
-            }
-            JsonObject(provider)
-        }
-        privateWrite(File(runtimeDir, "models.json"), JsonObject(models + ("providers" to JsonObject(converted))).toString())
+        privateWrite(File(runtimeDir, "models.json"), models.toString())
         val runtimeSettings = parseObject(snapshot.settingsText).toMutableMap().apply {
             remove("sessionDir") // Session location belongs to --session-dir, not settings.json.
             cfg.defaultProvider?.let { put("defaultProvider", JsonPrimitive(it)) }
@@ -155,9 +138,6 @@ class PiConfigManager(
         }
         piDir.mkdirs()
         if (!appendSystemFile.exists()) appendSystemFile.writeText(snapshot.appendSystem)
-        val reserved = setOf("--mode", "--session", "--session-dir", "--session-id", "--no-session", "--continue", "-c", "--resume", "-r", "--print", "-p", "--help", "-h", "--version", "-v")
-        require(cfg.extraArgs.none { it.substringBefore('=') in reserved }) { "Extra arguments cannot override the managed RPC lifecycle" }
-        require(cfg.env.keys.all { Regex("[A-Za-z_][A-Za-z0-9_]*").matches(it) }) { "Invalid environment variable name" }
         return runtimeProotPath
     }
 
@@ -172,7 +152,10 @@ class PiConfigManager(
         runCatching { parseObject(readSnapshot().modelsText)["providers"] as? JsonObject }.getOrNull()?.values?.forEach { value ->
             (value as? JsonObject)?.get("apiKey")?.jsonPrimitive?.contentOrNull?.takeIf { it.length >= 4 }?.let(secrets::add)
         }
-        listOf(File(agentDir, "auth.json"), File(paths.rootfsDir, "root/.pi/agent/auth.json"), File(runtimeHostDir, "auth.json")).filter { it.isFile }.forEach { file ->
+        val authFiles = runCatching {
+            listOf(File(agentDir, "auth.json"), File(paths.rootfsDir, "root/.pi/agent/auth.json"), File(runtimeHostDir, "auth.json"))
+        }.getOrDefault(emptyList())
+        authFiles.filter { it.isFile }.forEach { file ->
             runCatching { parseObject(file.readText()) }.getOrNull()?.values?.forEach { value ->
                 (value as? JsonObject)?.let { auth -> listOf("key", "access", "refresh").forEach { field ->
                     (auth[field] as? JsonPrimitive)?.contentOrNull?.takeIf { it.length >= 4 }?.let(secrets::add)
@@ -197,6 +180,40 @@ class PiConfigManager(
     }
 
     fun extraArgs(): List<String> = readUserConfig().extraArgs
+
+    private fun prepareModels(text: String, providerId: String, modelId: String): JsonObject {
+        val root = parsePiModels(text)
+        val providers = (root["providers"] as? JsonObject).orEmpty().mapValues { (id, value) -> normalizePiProvider(id, value as JsonObject) }.toMutableMap()
+        // A manually selected model must be registered for custom providers, not just named in settings.
+        val provider = providers[providerId]
+        if (provider != null && modelId.isNotBlank()) {
+            val models = (provider["models"] as? kotlinx.serialization.json.JsonArray).orEmpty()
+            if (models.none { (it as? JsonObject)?.get("id")?.jsonPrimitive?.contentOrNull == modelId }) {
+                providers[providerId] = JsonObject(provider + ("models" to kotlinx.serialization.json.JsonArray(models + customPiModel(modelId))))
+            }
+        }
+        return if (root.containsKey("providers") || providers.isNotEmpty()) JsonObject(root + ("providers" to JsonObject(providers))) else root
+    }
+
+    private fun runtimeModels(root: JsonObject, cfg: PiUserConfig): JsonObject {
+        val providers = (root["providers"] as? JsonObject) ?: return root
+        val converted = providers.mapValues { (_, value) ->
+            JsonObject((value as JsonObject).toMutableMap().apply {
+                remove("displayName")
+                val key = (get("apiKey") as? JsonPrimitive)?.contentOrNull
+                // PI resolves absent environment references itself; incomplete unused providers are allowed.
+                key?.let { cfg.env[it] }?.let { put("apiKey", JsonPrimitive(it)) }
+            })
+        }
+        return JsonObject(root + ("providers" to JsonObject(converted)))
+    }
+
+    private fun validateRuntimeConfig(cfg: PiUserConfig) {
+        val reserved = setOf("--mode", "--session", "--session-dir", "--session-id", "--no-session", "--continue", "-c", "--resume", "-r", "--print", "-p", "--help", "-h", "--version", "-v")
+        require(cfg.extraArgs.none { it.substringBefore('=') in reserved }) { "Extra arguments cannot override the managed RPC lifecycle" }
+        require(cfg.env.keys.all { Regex("[A-Za-z_][A-Za-z0-9_]*").matches(it) }) { "Invalid environment variable name" }
+        require(cfg.defaultProvider.isNullOrBlank() == cfg.defaultModel.isNullOrBlank()) { "Default provider and model must both be set or both be empty" }
+    }
 
     private fun parseObject(text: String): JsonObject {
         val parsed = try { JsonFormats.pretty.parseToJsonElement(text.ifBlank { "{}" }) }

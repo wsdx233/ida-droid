@@ -16,7 +16,9 @@ Agent 页面通过本地 `pi --mode rpc` 管理 proot 内的 Agent 进程，不�
 - **可靠状态** — 请求 ID 关联、响应超时、EOF/坏 JSON 失败闭合、取消和重连
 - **Session 管理** — 创建、切换、删除、重命名、启动/停止，历史持久化与旧格式迁移
 - **模型与推理控制** — Provider/Model、thinking、自动/手动 compact、steer/follow-up 队列
-- **附件与工作区** — 私有草稿、图片/文件附件、SAF 工作区浏览、导入/导出和保存回复
+- **自定义 Provider** — 外层选择弹窗直接新建，独立 ID、凭据、模型和推理能力声明，无数量上限
+- **PI 更新提示** — 启动检查容器内版本，用户确认后更新，可忽略指定版本；失败保留已安装版本
+- **附件与工作区** — 私有草稿、图片/文件附件、容器内目录选择与浏览、插入路径/文本和保存回复
 - **深度索引模式** — CodeGraph + ECC + codebase-memory 联动分析
 - **可诊断错误** — 当前阶段、等待时长、stderr 摘要、重试和停止入口
 
@@ -67,8 +69,8 @@ Android App (Kotlin / Jetpack Compose / Material 3)
 | `ProrootSupport.kt` | arm64 proroot 完整性/能力探测与 proot 回退 |
 | `RootfsConfigurator.kt` | resolv.conf、hosts、tmp 和 rootfs 启动配置 |
 | `AiConfigEditor.kt` | 可视化 AI Provider/Model 配置 UI |
-| `AiConfigTools.kt` | 配置导入导出、API 连接测试、模型列表拉取 |
-| `EndpointCompleter.kt` | API 端点 URL 自动补全 |
+| `PiProviderConfig.kt` | PI 原生配置校验、旧 Provider 字段转换与模型定义 |
+| `WorkspaceManager.kt` | 容器工作区选择、目录验证、文件与附件读取 |
 | `AgentModelCatalog.kt` | models.json 解析与模型目录 |
 | `IdaProotRuntime.kt` | proot 进程启动与参数管理 |
 
@@ -102,12 +104,17 @@ Android App (Kotlin / Jetpack Compose / Material 3)
 ## 使用
 
 1. **导入 rootfs**：首次启动需要导入预构建的 IDA rootfs 镜像
-2. **配置 AI Provider**：在设置页选择 Provider，填入 API Key，添加模型
-3. **启动 Agent Session**：创建新会话，选择模型，开始对话
-4. **逆向分析**：Agent 可通过 mcpc 调用 ida-mcp 操作 IDA，也可使用 jadx 等工具
-5. **文件传输**：通过 idadroid-file 桥在 Android 主机和容器之间传输文件
+2. **选择容器工作区**：在 Agent 的“工作区”或设置的“Pi 工作区路径”中选择 rootfs 内目录，默认 `/root/pi_workspace`；不使用 Android 本地文件夹选择器
+3. **配置 AI Provider**：在 Agent 配置页选择 Provider，填写 Base URL、API Key、API Type 和模型，点击“保存 Pi 配置”
+4. **启动 Agent Session**：创建新会话，选择模型，开始对话
+5. **逆向分析**：Agent 可通过 mcpc 调用 ida-mcp 操作 IDA，也可使用 jadx 等工具
+6. **文件传输**：通过 idadroid-file 桥在 Android 主机和容器之间传输文件
 
 ## AI Provider 配置
+
+输入即进入配置草稿，无需先按键盘“完成”再保存。简易设置与 models.json 编辑器共用 PI 格式 `baseUrl` / `api` / `apiKey`，保留其他 Provider、兼容性参数和模型元数据；旧 `baseURL` / `envKey` 在保存时转换。保存失败会显示错误，编辑器不会当作成功关闭。
+
+Provider 配置和会话保存在各自工作区的 `.idadroid/` 内，附件使用该工作区的 `.upload/`。切换工作区会停止旧 PI 进程并重新加载所选目录的配置与会话，不迁移或删除原目录；“恢复默认”也不会删除文件。工作区只允许 rootfs 真实目录，不允许外部绑定目录或符号链接。
 
 支持的开箱即用 Provider：
 

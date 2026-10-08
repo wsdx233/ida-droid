@@ -71,8 +71,13 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.rememberCoroutineScope
+import dev.idadroid.agent.normalizePiProvider
+import dev.idadroid.agent.parsePiModels
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -129,17 +134,20 @@ private val CostKnownKeys = setOf("input", "output", "cacheRead", "cacheWrite")
 fun AgentModelsEditorScreen(
     initialJson: String,
     onBack: () -> Unit,
-    onApply: (String) -> Unit,
-    modifier: Modifier = Modifier
+    onApply: suspend (String) -> Boolean,
+    modifier: Modifier = Modifier,
+    saveError: String? = null
 ) {
     var editor by remember(initialJson) { mutableStateOf(parseModelsEditorState(initialJson)) }
     var codeDialog by remember { mutableStateOf(false) }
     var codeText by remember { mutableStateOf(initialJson.ifBlank { "{\n  \"providers\": {}\n}" }) }
     var pendingDeleteProvider by remember { mutableStateOf<ProviderDraft?>(null) }
+    val scope = rememberCoroutineScope()
+    var saving by remember { mutableStateOf(false) }
 
     fun serializeOrShowError(): String? {
-        if (editor.parseFailed && editor.providers.isEmpty()) {
-            editor.error = "当前 models.json 解析失败。请先打开“代码”修复 JSON，或添加 Provider 后再覆盖保存。"
+        if (editor.parseFailed) {
+            editor.error = "当前 models.json 解析失败。请先打开“代码”修复 JSON；不会覆盖原始内容。"
             return null
         }
         return runCatching { editor.toJsonString() }
@@ -172,12 +180,18 @@ fun AgentModelsEditorScreen(
                         Text("代码")
                     }
                     Button(
-                        onClick = { serializeOrShowError()?.let(onApply) },
+                        onClick = {
+                            serializeOrShowError()?.let { json ->
+                                saving = true
+                                scope.launch { try { if (!onApply(json)) editor.error = "配置未保存；请查看保存错误并重试。" } finally { saving = false } }
+                            }
+                        },
+                        enabled = !saving,
                         modifier = Modifier.padding(end = 8.dp)
                     ) {
                         Icon(Icons.Rounded.Check, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(4.dp))
-                        Text("保存")
+                        Text(if (saving) "保存中…" else "保存")
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface)
@@ -185,7 +199,7 @@ fun AgentModelsEditorScreen(
         }
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding)) {
-            editor.error?.let { message ->
+            (saveError ?: editor.error)?.let { message ->
                 Surface(
                     color = MaterialTheme.colorScheme.errorContainer,
                     contentColor = MaterialTheme.colorScheme.onErrorContainer,
@@ -241,7 +255,7 @@ fun AgentModelsEditorScreen(
                         editor = next
                         codeDialog = false
                     }
-                    .onFailure { error -> editor.error = "JSON 解析失败：${error.message}" }
+                    .onFailure { editor.error = "JSON 配置无效；内容未应用（解析详情隐藏以保护凭据）" }
             }
         )
     }
@@ -429,7 +443,8 @@ private fun ProviderDetailsCard(provider: ProviderDraft, onDelete: () -> Unit) {
             OutlinedTextField(
                 value = provider.apiKey,
                 onValueChange = { provider.apiKey = it },
-                label = { Text("API Key（支持 !command 等）") },
+                label = { Text("API Key（支持环境变量名 / !command）") },
+                visualTransformation = PasswordVisualTransformation(),
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth()
             )
@@ -849,14 +864,13 @@ private class ModelsEditorState(
         providers.forEach { provider ->
             val id = provider.id.trim()
             require(id.isNotBlank()) { "Provider ID 不能为空" }
-            require(id !in providerMap) { "Provider ID 重复：$id" }
-            provider.models.forEach { model -> require(model.id.trim().isNotBlank()) { "Provider [$id] 中存在空 Model ID" } }
+            require(id !in providerMap) { "Provider ID 重复" }
+            provider.models.forEach { model -> require(model.id.trim().isNotBlank()) { "Model ID 不能为空" } }
             providerMap[id] = provider.toJsonObject()
         }
-        val root = linkedMapOf<String, JsonElement>()
-        root.putAll(rootExtra)
-        root["providers"] = JsonObject(providerMap)
-        return ModelsEditorJson.encodeToString(JsonObject(root))
+        val root = JsonObject(rootExtra + ("providers" to JsonObject(providerMap)))
+        parsePiModels(root.toString())
+        return ModelsEditorJson.encodeToString(root)
     }
 }
 
@@ -988,17 +1002,19 @@ private class CostDraft(
     input: String = "",
     output: String = "",
     cacheRead: String = "",
-    cacheWrite: String = ""
+    cacheWrite: String = "",
+    val extra: Map<String, JsonElement> = emptyMap()
 ) {
     var input by mutableStateOf(input)
     var output by mutableStateOf(output)
     var cacheRead by mutableStateOf(cacheRead)
     var cacheWrite by mutableStateOf(cacheWrite)
 
-    fun deepCopy(): CostDraft = CostDraft(input, output, cacheRead, cacheWrite)
+    fun deepCopy(): CostDraft = CostDraft(input, output, cacheRead, cacheWrite, extra)
 
     fun toJsonObject(): JsonObject {
         val result = linkedMapOf<String, JsonElement>()
+        result.putAll(extra)
         parseNumberPrimitive(input, "cost.input")?.let { result["input"] = it }
         parseNumberPrimitive(output, "cost.output")?.let { result["output"] = it }
         parseNumberPrimitive(cacheRead, "cost.cacheRead")?.let { result["cacheRead"] = it }
@@ -1008,13 +1024,12 @@ private class CostDraft(
 }
 
 private fun parseModelsEditorState(text: String): ModelsEditorState = runCatching { parseModelsEditorStateOrThrow(text) }
-    .getOrElse { ModelsEditorState(rawText = text, parseError = "JSON 解析失败：${it.message}") }
+    .getOrElse { ModelsEditorState(rawText = text, parseError = "JSON 配置无效；原始内容保留（解析详情隐藏以保护凭据）") }
 
 private fun parseModelsEditorStateOrThrow(text: String): ModelsEditorState {
-    val root = ModelsEditorJson.parseToJsonElement(text.ifBlank { "{}" }) as? JsonObject
-        ?: error("models.json 必须是 JSON object")
+    val root = parsePiModels(text)
     val providersObj = root["providers"] as? JsonObject ?: JsonObject(emptyMap())
-    val providers = providersObj.entries.map { (id, element) -> parseProvider(id, element as? JsonObject ?: JsonObject(emptyMap())) }
+    val providers = providersObj.entries.map { (id, element) -> parseProvider(id, normalizePiProvider(id, element as JsonObject)) }
     return ModelsEditorState(
         providers = providers,
         rootExtra = root.extraWithout(setOf("providers")),
@@ -1038,6 +1053,8 @@ private fun parseProvider(id: String, obj: JsonObject): ProviderDraft = Provider
 
 private fun parseCompat(obj: JsonObject?): CompatDraft {
     if (obj == null) return CompatDraft()
+    CompatFlags.forEach { flag -> obj[flag.key]?.let { require(it is JsonPrimitive && !it.isString && it.booleanOrNull != null) { "compat.${flag.key} 必须是布尔值" } } }
+    listOf("maxTokensField", "thinkingFormat", "cacheControlFormat").forEach { field -> obj[field]?.let { require(it is JsonPrimitive && it.isString) { "compat.$field 必须是字符串" } } }
     val flags = CompatFlags.associate { flag -> flag.key to obj.booleanValue(flag.key) }
     return CompatDraft(
         flags = flags,
@@ -1066,7 +1083,8 @@ private fun parseCost(obj: JsonObject?): CostDraft {
         input = obj.numberText("input"),
         output = obj.numberText("output"),
         cacheRead = obj.numberText("cacheRead"),
-        cacheWrite = obj.numberText("cacheWrite")
+        cacheWrite = obj.numberText("cacheWrite"),
+        extra = obj.extraWithout(CostKnownKeys)
     )
 }
 
@@ -1108,6 +1126,6 @@ private fun parseNumberPrimitive(raw: String, field: String): JsonPrimitive? {
     val trimmed = raw.trim()
     if (trimmed.isBlank()) return null
     trimmed.toLongOrNull()?.let { return JsonPrimitive(it) }
-    val value = trimmed.toDoubleOrNull() ?: throw IllegalArgumentException("$field 必须是数字")
+    val value = trimmed.toDoubleOrNull()?.takeIf { it.isFinite() } ?: throw IllegalArgumentException("$field 必须是有限数字")
     return JsonPrimitive(value)
 }

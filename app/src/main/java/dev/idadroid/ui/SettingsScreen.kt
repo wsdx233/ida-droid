@@ -63,6 +63,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import dev.idadroid.service.FloatingWindowService
+import dev.idadroid.IdaDroidApplication
 import dev.idadroid.settings.IdaDroidSettings
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -786,12 +787,14 @@ fun SettingsScreen(
         )
     }
     if (editWorkspace) {
-        TextEditDialog(
-            title = "Pi 工作区路径", initialValue = env.workspacePath,
-            label = "容器内 pi 工作区路径",
-            helper = "默认 /root/pi_workspace，可改为 /sdcard/xxx 等外部路径",
+        ContainerWorkspacePicker(
+            initialPath = env.workspacePath,
             onDismiss = { editWorkspace = false },
-            onSave = { value -> settingsStore.updateWorkspacePath(value); editWorkspace = false }
+            onSelected = { path ->
+                val manager = (context.applicationContext as IdaDroidApplication).agentManager
+                selectContainerWorkspace(manager, path)
+                editWorkspace = false
+            }
         )
     }
     if (confirmEnvReset) {
